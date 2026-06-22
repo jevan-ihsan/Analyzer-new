@@ -215,19 +215,26 @@ st.sidebar.markdown('''
 </div>
 ''', unsafe_allow_html=True)
 
-# Select sample file or upload file
-data_mode = st.sidebar.radio("Pilih Mode Unggah Data", ["Gunakan File Contoh (Default)", "Unggah File Baru (.xlsx)"])
+import tempfile
 
-file_path = None
-uploaded_file = None
-
-# Default local files in repo
+# Default local files (only available when running locally)
 excel_dir = "/Users/jevanhava/Documents/Internship/Askrindo Syariah/Data/Excel"
 default_files = [
     "JPAS_Analysis_Enhanced.xlsx",
     "Draf 20260612 12.18 WIB - Worksheet JPAS Data Financial Mei 2026.xlsx",
     "Draf Final 20260618 - Worksheet Rapat Evaluasi Anper Mei 2026.xlsx"
 ]
+local_files_available = os.path.isdir(excel_dir)
+
+# Select mode — hide sample mode if running on cloud (files not available)
+if local_files_available:
+    data_mode = st.sidebar.radio("Pilih Mode Unggah Data", ["Gunakan File Contoh (Default)", "Unggah File Baru (.xlsx)"])
+else:
+    data_mode = "Unggah File Baru (.xlsx)"
+    st.sidebar.info("Mode cloud: unggah file Excel JPAS untuk memulai analisis.")
+
+file_path = None
+uploaded_file = None
 
 if data_mode == "Gunakan File Contoh (Default)":
     selected_sample = st.sidebar.selectbox("Pilih file contoh:", default_files)
@@ -235,10 +242,13 @@ if data_mode == "Gunakan File Contoh (Default)":
 else:
     uploaded_file = st.sidebar.file_uploader("Unggah file Excel JPAS (.xlsx)", type=["xlsx"])
     if uploaded_file:
-        # Save temp file
-        file_path = os.path.join("/Users/jevanhava/.gemini/antigravity-ide/brain/e13fc927-4351-403c-bf5b-8d690336ff3a/scratch", uploaded_file.name)
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+        # Use tempfile — works on both local and cloud (Streamlit Community Cloud)
+        suffix = os.path.splitext(uploaded_file.name)[1]
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.write(uploaded_file.getbuffer())
+        tmp.flush()
+        file_path = tmp.name
+
 
 # Process File
 if file_path and os.path.exists(file_path):
