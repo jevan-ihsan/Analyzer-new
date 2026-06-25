@@ -109,5 +109,4 @@ server {
 
 ## Kontak
 
-Intern: Jevan Hava — jevan.ihsan@askrindo-syariah.co.id  
 Repository: https://github.com/jevan-ihsan/jpas-tracker-manbis
