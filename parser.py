@@ -316,6 +316,16 @@ def parse_huw_sheet(xl, sheet_name=None):
     df = xl.parse(huw_sheet)
     if len(df) < 2:
         return None
+    # Guard: reject pivot/mitra sheets misclassified as HUW.
+    # A valid HUW sheet must have numeric data in the majority of cells.
+    # Pivot/mitra sheets have many text cells like "Row Labels", bank names, etc.
+    sample = df.iloc[:min(10, len(df)), 1:]
+    text_cells = sum(1 for _, row in sample.iterrows()
+                     for v in row if isinstance(v, str) and v.strip() and v.strip().lower() not in ['nan', 'none'])
+    numeric_cells = sum(1 for _, row in sample.iterrows()
+                        for v in row if isinstance(v, (int, float)) and not pd.isna(v))
+    if text_cells > numeric_cells and text_cells > 5:
+        return None
         
     raw_headers = [str(x).strip().replace('\n', ' ') for x in df.iloc[1].values]
     unique_headers = []
@@ -1498,10 +1508,10 @@ def parse_unified_pl_sheet(df):
             mapped_key = 'change_unearned_ijk'
         elif 'penurunan (kenaikan) ijk ybmp' in label_norm or 'kenaikan (penurunan) ijk ybmp' in label_norm:
             mapped_key = 'change_unearned_ijk'
-        elif 'pendapatan underwriting' in label_norm or 'jumlah pendapatan kafalah' in label_norm:
-            mapped_key = 'net_underwriting_revenue'
         elif 'pendapatan underwriting lain' in label_norm or 'penerimaan kafalah lain' in label_norm:
             mapped_key = 'other_underwriting_revenue'
+        elif 'pendapatan underwriting' in label_norm or 'jumlah pendapatan kafalah' in label_norm:
+            mapped_key = 'net_underwriting_revenue'
         elif 'ta\'widh bruto' in label_norm or 'tawidh bruto' in label_norm or label_norm == 'ta\'widh' or label_norm == 'tawidh' or label_norm == 'beban klaim':
             mapped_key = 'gross_claims'
         elif 'ta\'widh reasuransi' in label_norm or 'tawidh reas' in label_norm:

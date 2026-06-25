@@ -192,18 +192,23 @@ def calculate_ratios(parsed_data):
     ebit = pl.get('operating_profit', {}).get('curr_month', 0.0)
     revenue = abs(ijk_bruto)
     total_assets = bs.get('total_assets', {}).get('curr_month', 0.0)
-    
-    # Defaults if missing to prevent div by zero
+
+    # BS and PL data are in full Rupiah; gr_data equity is in Jutaan — use BS equity for DuPont
+    equity_bs = bs.get('total_equity', {}).get('curr_month', 0.0)
+    if equity_bs == 0.0:
+        equity_bs = equity * 1_000_000.0  # fallback: convert gr_data Jutaan → full Rp
+
+    # total_assets fallback: gr_data equity (Jutaan) * reasonable leverage
     if total_assets == 0.0:
-        total_assets = 6451631.0 # fallback approx
+        total_assets = equity_bs * 3.0 if equity_bs > 0 else equity * 3_000_000.0
     if ebit == 0.0:
         ebit = ebt + 1000.0 if ebt != 0 else 1.0
-        
+
     tax_burden = net_profit / ebt if ebt != 0 else 0.0
     interest_burden = ebt / ebit if ebit != 0 else 0.0
     ebit_margin = ebit / revenue if revenue != 0 else 0.0
     asset_turnover = revenue / total_assets if total_assets != 0 else 0.0
-    leverage = total_assets / equity if equity != 0 else 1.0
+    leverage = total_assets / equity_bs if equity_bs != 0 else 1.0
     
     roe = tax_burden * interest_burden * ebit_margin * asset_turnover * leverage * 100.0
     
