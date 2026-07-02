@@ -1,41 +1,69 @@
 import pandas as pd
 import numpy as np
+from utils import detect_current_period
 
 def calculate_ratios(parsed_data):
     """
     Computes key financial and performance ratios from parsed data.
     All calculations are returned as clean values, handling division by zero.
+    Missing source data is reported in ratios['data_warnings'] instead of
+    being substituted with invented numbers.
     """
     pl = parsed_data.get('pl_data', {})
     bs = parsed_data.get('bs_data', {})
     gr = parsed_data.get('gr_data', {})
     mitra = parsed_data.get('mitra_data', [])
-    
+
     ratios = {}
+    data_warnings = []
+    period = detect_current_period(pl, bs)
+    ratios['period'] = period
     
     # 1. Underwriting Performance
     # Retrieve current month YTD values
-    net_uw_income = pl.get('net_underwriting_revenue', {}).get('curr_month', 0.0)
+    ijk_bruto_raw = pl.get('ijk_revenue', {}).get('curr_month', 0.0)
+    reinsurance_expense_uw = pl.get('reinsurance_expense', {}).get('curr_month', 0.0)
+    change_unearned_ijk = pl.get('change_unearned_ijk', {}).get('curr_month', 0.0)
+
+    # Pendapatan Premi Neto (official) = IJK Bruto - Beban Reasuransi + (Penurunan/Kenaikan IJK YBMP)
+    # change_unearned_ijk keeps its natural sign (negative when unearned reserve grows).
+    if abs(ijk_bruto_raw) > 0 and (abs(reinsurance_expense_uw) > 0 or change_unearned_ijk != 0.0):
+        net_premium_neto = abs(ijk_bruto_raw) - abs(reinsurance_expense_uw) + change_unearned_ijk
+    else:
+        # Fallback: use the parsed net_underwriting_revenue directly from Excel
+        net_premium_neto = pl.get('net_underwriting_revenue', {}).get('curr_month', 0.0)
+    # Kept under the old name for downstream consumers (KPI cards, etc.)
+    net_uw_income = net_premium_neto if net_premium_neto > 0 else pl.get('net_underwriting_revenue', {}).get('curr_month', 0.0)
+
     gross_claims = pl.get('gross_claims', {}).get('curr_month', 0.0)
     gross_claims_prev = pl.get('gross_claims', {}).get('yoy_prev', 0.0)
     yoy_gross_claims = ((gross_claims - gross_claims_prev) / abs(gross_claims_prev) * 100.0) if gross_claims_prev != 0 else 0.0
-    
+
     reinsurance_claims = pl.get('reinsurance_claims', {}).get('curr_month', 0.0)
+    change_claims_retention = pl.get('change_claims_retention', {}).get('curr_month', 0.0)
     net_recoveries = pl.get('net_recoveries', {}).get('curr_month', 0.0)
     net_recoveries_prev = pl.get('net_recoveries', {}).get('yoy_prev', 0.0)
     yoy_net_recoveries = ((net_recoveries - net_recoveries_prev) / abs(net_recoveries_prev) * 100.0) if net_recoveries_prev != 0 else 0.0
-    
-    # Claims Net
-    claims_net = abs(gross_claims) - abs(reinsurance_claims) - abs(net_recoveries)
-    claims_net = max(claims_net, 0.0)
-    
-    loss_ratio = (claims_net / net_uw_income * 100.0) if net_uw_income > 0 else 0.0
-    
+
+    # Beban Klaim Bersih (official) = Ta'widh Bruto - Ta'widh Reas + Kenaikan ETRS - Recoveries
+    # change_claims_retention keeps its natural sign (positive when reserve grows).
+    claims_net = abs(gross_claims) - abs(reinsurance_claims) + change_claims_retention - abs(net_recoveries)
+
+    loss_ratio = (claims_net / net_premium_neto * 100.0) if net_premium_neto > 0 else 0.0
+
+    # Komisi Neto = beban akuisisi (net) - komisi penjaminan ulang (net); negative = net income.
+    commission_expense_net = abs(pl.get('commission_expense', {}).get('curr_month', 0.0))
+    reinsurance_commission_net = abs(pl.get('reinsurance_commission', {}).get('curr_month', 0.0))
+    net_commission = commission_expense_net - reinsurance_commission_net
+
+    investment_income_uw = pl.get('investment_income', {}).get('curr_month', 0.0)
     total_opex = abs(pl.get('total_operating_expense', {}).get('curr_month', 0.0))
-    total_opex_rkap = abs(pl.get('total_operating_expense', {}).get('rkap_fy', 176500.0))
-    expense_ratio = (total_opex / net_uw_income * 100.0) if net_uw_income > 0 else 0.0
+    total_opex_rkap = abs(pl.get('total_operating_expense', {}).get('rkap_fy', 0.0))
+    # Expense Ratio (official) = (Beban Usaha + Komisi Neto) / (Pendapatan Premi Neto + Hasil Investasi)
+    expense_denom = net_premium_neto + investment_income_uw
+    expense_ratio = ((total_opex + net_commission) / expense_denom * 100.0) if expense_denom > 0 else 0.0
     combined_ratio = loss_ratio + expense_ratio
-    
+
     ijk_bruto = pl.get('ijk_revenue', {}).get('curr_month', 0.0)
     ijk_bruto_prev = pl.get('ijk_revenue', {}).get('yoy_prev', 0.0)
     yoy_ijk_bruto = ((ijk_bruto - ijk_bruto_prev) / abs(ijk_bruto_prev) * 100.0) if ijk_bruto_prev != 0 else 0.0
@@ -110,12 +138,19 @@ def calculate_ratios(parsed_data):
     equity = gr.get('equity', 0.0)
     gearing_ratio = gr.get('gearing_ratio', 0.0)
     
-    if os_net == 0.0 and 'total_assets' in bs:
-        # Fallback approximation from balance sheet and KB
-        equity = bs.get('total_equity', {}).get('curr_month', 1206870.0)
-        os_net = 35783954.0 # Net OS YTD Mei 2026
-        gearing_ratio = os_net / equity if equity > 0 else 0.0
+    # If gearing sheet didn't provide equity, fallback to Balance Sheet equity (real data, not hardcoded)
+    if equity == 0.0:
+        equity = bs.get('total_equity', {}).get('curr_month', 0.0)
         
+    if gearing_ratio == 0.0 and equity > 0.0:
+        gearing_ratio = os_net / equity
+        
+    if gearing_ratio == 0.0:
+        data_warnings.append(
+            "Data gearing ratio (lembar evaluasi/outstanding penjaminan) tidak ditemukan — "
+            "KPI gearing menampilkan nol, bukan nilai aktual."
+        )
+
     limit_gearing = 40.0
     headroom = limit_gearing - gearing_ratio
     additional_capacity_triliun = (headroom * equity) / 1_000_000.0 if equity > 0 else 0.0
@@ -176,17 +211,12 @@ def calculate_ratios(parsed_data):
                 'share_pct': share
             })
     else:
-        # Fallback from KB
-        bsi_share = 46.9
-        pnm_share = 22.2
-        top3_share = 88.0
-        hhi = (46.9**2) + (22.2**2) + (18.9**2)
-        concentration_list = [
-            {'partner': 'PT BSI Tbk', 'os_kafalah_juta': 29229793.0, 'share_pct': 46.9},
-            {'partner': 'PT PNM', 'os_kafalah_juta': 13817787.0, 'share_pct': 22.2},
-            {'partner': 'PT BANK SYARIAH NASIONAL', 'os_kafalah_juta': 11763032.0, 'share_pct': 18.9}
-        ]
-        
+        # No partner data parsed — report it honestly instead of substituting stale numbers.
+        data_warnings.append(
+            "Data mitra (plafon/rekapan kafalah) tidak ditemukan pada file yang diunggah — "
+            "analisis konsentrasi mitra tidak tersedia."
+        )
+
     # 6. DuPont 5-Factor Analysis
     ebt = pl.get('pretax_profit', {}).get('curr_month', 0.0)
     ebit = pl.get('operating_profit', {}).get('curr_month', 0.0)
@@ -198,11 +228,16 @@ def calculate_ratios(parsed_data):
     if equity_bs == 0.0:
         equity_bs = equity * 1_000_000.0  # fallback: convert gr_data Jutaan → full Rp
 
-    # total_assets fallback: gr_data equity (Jutaan) * reasonable leverage
     if total_assets == 0.0:
-        total_assets = equity_bs * 3.0 if equity_bs > 0 else equity * 3_000_000.0
-    if ebit == 0.0:
-        ebit = ebt + 1000.0 if ebt != 0 else 1.0
+        data_warnings.append(
+            "Total Aset tidak ditemukan di Neraca — faktor DuPont (asset turnover, leverage, ROE) tidak dapat dihitung."
+        )
+    if ebit == 0.0 and ebt != 0.0:
+        # Laba Usaha row missing; approximate EBIT with EBT (assumes no non-operating items).
+        ebit = ebt
+        data_warnings.append(
+            "Laba Usaha (EBIT) tidak ditemukan — interest burden DuPont diasumsikan 1,0 (EBIT = EBT)."
+        )
 
     tax_burden = net_profit / ebt if ebt != 0 else 0.0
     interest_burden = ebt / ebit if ebit != 0 else 0.0
@@ -225,16 +260,17 @@ def calculate_ratios(parsed_data):
     # 1. Likuiditas: approx current assets / current liab
     # 2. Gearing
     # 3. ROA: (Net Profit disetahunkan / Rata-rata Aset) * 100
-    # Let's annualize the Net Profit (Mei = 5 months)
-    month_factor = 5.0 # May 2026 is month 5
+    # Annualize YTD net profit using the number of elapsed months in the detected period
+    month_factor = float(period['month'])
     net_profit_annualized = net_profit * 12.0 / month_factor
     
     total_assets_prev = bs.get('total_assets', {}).get('prev_year_yoy', 0.0)
     avg_assets = (total_assets + total_assets_prev) / 2.0 if total_assets_prev > 0.0 else total_assets
     roa = (net_profit_annualized / avg_assets) * 100.0 if avg_assets > 0.0 else 0.0
     
-    # 4. BOPO: Total Opex / Total Revenue
-    bopo = (total_opex / revenue) * 100.0 if revenue != 0 else 0.0
+    # BOPO (official) = (Beban Klaim Neto + Beban Usaha) / (Pendapatan Underwriting Neto + Hasil Investasi)
+    bopo_denominator = net_uw_income + invest_income_curr
+    bopo = ((claims_net + total_opex) / bopo_denominator * 100.0) if bopo_denominator > 0 else 0.0
     # 5. Klaim Neto: (Net Claims / Net UW Income) = loss_ratio
     # Nilai mapping (simplified)
     score_gearing = 1 if gearing_ratio <= 30 else (2 if gearing_ratio <= 40 else 3)
@@ -348,5 +384,6 @@ def calculate_ratios(parsed_data):
         'hhi_index': hhi,
         'mitra_shares': concentration_list
     }
-    
+
+    ratios['data_warnings'] = data_warnings
     return ratios

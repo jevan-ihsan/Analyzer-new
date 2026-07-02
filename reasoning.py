@@ -1,40 +1,5 @@
 import pandas as pd
-
-def format_id(val, is_pct=False, is_currency=False, is_ratio=False, decimals=1, prefix="", suffix=""):
-    """
-    Format a numeric value in Indonesian style:
-    - Dot as thousands separator
-    - Comma as decimal separator
-    """
-    if pd.isna(val) or val is None:
-        return "-"
-    
-    try:
-        val_num = float(val)
-    except Exception:
-        return str(val)
-        
-    if abs(val_num) < 1e-9:
-        return "-"
-        
-    fmt_str = f"{{:,.{decimals}f}}"
-    formatted = fmt_str.format(val_num)
-    
-    parts = formatted.split('.')
-    thousands = parts[0].replace(',', '.')
-    if len(parts) > 1:
-        decimal = parts[1]
-        result = f"{thousands},{decimal}"
-    else:
-        result = thousands
-        
-    if is_pct:
-        return f"{prefix}{result}%{suffix}"
-    elif is_currency:
-        return f"Rp {prefix}{result}{suffix}"
-    elif is_ratio:
-        return f"{prefix}{result}x{suffix}"
-    return f"{prefix}{result}{suffix}"
+from utils import format_id
 
 def generate_takeaways_and_critique(ratios, parsed=None):
     """
@@ -189,16 +154,17 @@ def generate_takeaways_and_critique(ratios, parsed=None):
             f"tercatat sebesar Rp {add_capacity} Triliun."
         )
         
-    # P3: Serapan Beban Usaha
-    opex_pct = (uw.get('total_opex_juta', 0) / uw.get('total_opex_rkap_juta', 1)) * 100 if uw.get('total_opex_rkap_juta', 0) > 0 else 0
-    opex_pct_val = format_id(opex_pct, decimals=1)
-    total_opex = format_id(uw.get('total_opex_juta', 0) / 1_000_000_000.0, decimals=1)
-    total_opex_rkap = format_id(uw.get('total_opex_rkap_juta', 0) / 1_000_000_000.0, decimals=1)
-    
-    perhatian.append(
-        f"**P3: Serapan Anggaran Beban Usaha**: Serapan anggaran Beban Usaha mencapai {opex_pct_val}% YTD "
-        f"(Rp {total_opex} M dari plafon RKAP Rp {total_opex_rkap} M)."
-    )
+    # P3: Serapan Beban Usaha — only when the file actually contains an RKAP budget
+    if uw.get('total_opex_rkap_juta', 0) > 0:
+        opex_pct = (uw.get('total_opex_juta', 0) / uw['total_opex_rkap_juta']) * 100
+        opex_pct_val = format_id(opex_pct, decimals=1)
+        total_opex = format_id(uw.get('total_opex_juta', 0) / 1_000_000_000.0, decimals=1)
+        total_opex_rkap = format_id(uw['total_opex_rkap_juta'] / 1_000_000_000.0, decimals=1)
+
+        perhatian.append(
+            f"**P3: Serapan Anggaran Beban Usaha**: Serapan anggaran Beban Usaha mencapai {opex_pct_val}% YTD "
+            f"(Rp {total_opex} M dari plafon RKAP Rp {total_opex_rkap} M)."
+        )
 
     # 3. Temuan Positif (Kekuatan & Integritas)
     positif = []

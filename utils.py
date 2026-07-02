@@ -1,5 +1,56 @@
+import logging
 import pandas as pd
 import re
+
+logger = logging.getLogger("jpas.utils")
+
+MONTHS_ID = ["Januari", "Februari", "Maret", "April", "Mei", "Juni",
+             "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
+
+_MONTH_KEY_RE = re.compile(
+    r'^(Januari|Februari|Maret|April|Mei|Juni|Juli|Agustus|September|Oktober|November|Desember) (20\d{2})$'
+)
+
+def detect_current_period(pl_data=None, bs_data=None, default_label="Mei 2026"):
+    """
+    Detect the current reporting period from month-labeled keys produced by the
+    parser (e.g. 'Mei 2026'). Returns a dict with the current, previous-month,
+    and same-month-previous-year labels plus the month number used for
+    annualization. Falls back to `default_label` when no month keys are found.
+    """
+    latest = None  # (year, month)
+    for data in (pl_data or {}, bs_data or {}):
+        for entry in data.values():
+            if not isinstance(entry, dict):
+                continue
+            for key in entry:
+                m = _MONTH_KEY_RE.match(str(key))
+                if not m:
+                    continue
+                # 'Desember <year>' keys come from audited prior-year columns
+                # (classify_columns), not the current reporting month — skip them.
+                if m.group(1) == "Desember":
+                    continue
+                month_num = MONTHS_ID.index(m.group(1)) + 1
+                candidate = (int(m.group(2)), month_num)
+                if latest is None or candidate > latest:
+                    latest = candidate
+
+    if latest is None:
+        m = _MONTH_KEY_RE.match(default_label)
+        latest = (int(m.group(2)), MONTHS_ID.index(m.group(1)) + 1)
+
+    year, month = latest
+    prev_month = month - 1 if month > 1 else 12
+    prev_year = year if month > 1 else year - 1
+    return {
+        'label': f"{MONTHS_ID[month - 1]} {year}",
+        'month': month,
+        'year': year,
+        'month_name': MONTHS_ID[month - 1],
+        'prev_label': f"{MONTHS_ID[prev_month - 1]} {prev_year}",
+        'yoy_label': f"{MONTHS_ID[month - 1]} {year - 1}",
+    }
 
 def classify_sheet_by_content(df):
     """
@@ -18,44 +69,54 @@ def classify_sheet_by_content(df):
     # Clean up text content to set of strings
     text_set = {re.sub(r'\s+', ' ', s) for s in text_content}
     
-    # Keywords definitions
+    # Keywords definitions — matched as substrings so extra words, prefixes,
+    # or numbering in a cell don't break recognition.
     bs_keywords = {
-        'kas dan bank', 'kas dan giro bank', 'piutang imbal jasa kafalah', 
-        'piutang tawidh', "piutang ta'widh", 'aset tetap', 'jumlah aset', 
-        'total aset', 'jumlah liabilitas', 'total liabilitas', 'jumlah ekuitas', 
-        'total ekuitas', 'cadangan klaim', 'estimasi tawidh retensi sendiri',
-        'deposito berjangka mudharabah', 'deposito pada bank', 'reksa dana syariah'
+        'kas dan bank', 'kas dan giro bank', 'kas dan setara kas',
+        'piutang imbal jasa kafalah', 'piutang premi',
+        'piutang tawidh', "piutang ta'widh", 'aset tetap', 'aktiva tetap',
+        'jumlah aset', 'total aset', 'jumlah aktiva', 'total aktiva',
+        'jumlah liabilitas', 'total liabilitas', 'jumlah kewajiban', 'total kewajiban',
+        'jumlah ekuitas', 'total ekuitas', 'jumlah modal', 'saldo laba',
+        'cadangan klaim', 'estimasi tawidh retensi sendiri',
+        'deposito berjangka mudharabah', 'deposito pada bank', 'reksa dana syariah', 'reksadana'
     }
-    
+
     pl_keywords = {
-        'imbal jasa kafalah bruto', 'beban penjaminan ulang', 'tawidh bruto', 
-        "ta'widh bruto", 'laba setelah pajak', 'laba tahun berjalan', 
-        'jumlah pendapatan kafalah', 'pendapatan underwriting', 'beban kafalah', 
+        'imbal jasa kafalah bruto', 'beban penjaminan ulang', 'tawidh bruto',
+        "ta'widh bruto", 'laba setelah pajak', 'laba tahun berjalan',
+        'jumlah pendapatan kafalah', 'pendapatan underwriting', 'beban kafalah',
         'hasil underwriting neto', 'laba sebelum pajak', 'laba usaha',
-        'pendapatan jasa penjaminan (ijk)', 'hasil investasi'
+        'pendapatan jasa penjaminan (ijk)', 'hasil investasi',
+        'pendapatan premi', 'premi bruto', 'beban klaim', 'klaim bruto',
+        'laba bersih', 'beban reasuransi', 'beban usaha', 'beban operasional',
+        'laba (rugi)', 'pendapatan penjaminan'
     }
-    
+
     gearing_keywords = {
-        'nilai penjaminan ditanggung sendiri', 'modal sendiri bersih', 
+        'nilai penjaminan ditanggung sendiri', 'modal sendiri bersih',
         'gearing ratio', 'gearing ratio (nilai baris 1:2)', 'gearing ratio aktual'
     }
-    
+
     cf_keywords = {
         'arus kas dari aktivitas', 'kas bersih', 'arus kas bersih', 'aktivitas operasi',
         'aktivitas investasi', 'aktivitas pendanaan', 'arus kas', 'posisi arus kas', 'posisi arus kas (cashflow)'
     }
-    
+
     huw_keywords = {
-        'hasil underwriting', 'mikro pnm', 'kur mikro', 'retail & korporasi', 
+        'hasil underwriting', 'mikro pnm', 'kur mikro', 'retail & korporasi',
         'kur super mikro'
     }
-    
-    # Check matches count
-    bs_matches = len(bs_keywords.intersection(text_set))
-    pl_matches = len(pl_keywords.intersection(text_set))
-    gearing_matches = any(k in text_set for k in gearing_keywords)
+
+    # Check matches count (substring-based: a keyword counts if any cell contains it)
+    def count_matches(keywords):
+        return sum(1 for k in keywords if any(k in s for s in text_set))
+
+    bs_matches = count_matches(bs_keywords)
+    pl_matches = count_matches(pl_keywords)
+    gearing_matches = any(k in s for s in text_set for k in gearing_keywords)
     cf_matches = any(k in s for s in text_set for k in cf_keywords)
-    huw_matches = len(huw_keywords.intersection(text_set))
+    huw_matches = count_matches(huw_keywords)
     mitra_matches = any(k in s for s in text_set for k in ['mitra', 'plafon'])
     
     results = []
@@ -120,7 +181,67 @@ def detect_excel_type(file_path):
             return 'worksheet_financial'
             
         return 'unknown'
-    except Exception as e:
-        print(f"Error detecting file type: {e}")
+    except Exception:
+        logger.exception("Error detecting file type for '%s'", file_path)
         return 'unknown'
+
+def format_id(val, is_pct=False, is_currency=False, is_ratio=False, decimals=2, prefix="", suffix=""):
+    """
+    Format a numeric value in Indonesian style:
+    - Dot as thousands separator
+    - Comma as decimal separator
+    - Handle strings, NaNs, floats, ints
+    """
+    if pd.isna(val) or val is None:
+        return "-"
+    
+    try:
+        if isinstance(val, str):
+            val_clean = val.replace('Rp', '').replace('%', '').replace('x', '').replace(' ', '').strip()
+            if not val_clean:
+                return "-"
+            if ',' in val_clean and '.' in val_clean:
+                if val_clean.rfind('.') > val_clean.rfind(','):
+                    val_clean = val_clean.replace(',', '')
+                else:
+                    val_clean = val_clean.replace('.', '').replace(',', '.')
+            elif ',' in val_clean:
+                parts = val_clean.split(',')
+                if len(parts[-1]) == 3:
+                    val_clean = val_clean.replace(',', '')
+                else:
+                    val_clean = val_clean.replace(',', '.')
+            elif '.' in val_clean:
+                parts = val_clean.split('.')
+                if len(parts[-1]) == 3:
+                    val_clean = val_clean.replace('.', '')
+                else:
+                    pass
+            val_num = float(val_clean)
+        else:
+            val_num = float(val)
+    except Exception:
+        return str(val)
+        
+    if abs(val_num) < 1e-9:
+        return "-"
+        
+    fmt_str = f"{{:,.{decimals}f}}"
+    formatted = fmt_str.format(val_num)
+    
+    parts = formatted.split('.')
+    thousands = parts[0].replace(',', '.')
+    if len(parts) > 1:
+        decimal = parts[1]
+        result = f"{thousands},{decimal}"
+    else:
+        result = thousands
+        
+    if is_pct:
+        return f"{prefix}{result}%{suffix}"
+    elif is_currency:
+        return f"Rp{prefix}{result}{suffix}"
+    elif is_ratio:
+        return f"{prefix}{result}x{suffix}"
+    return f"{prefix}{result}{suffix}"
 
