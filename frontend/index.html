@@ -367,7 +367,10 @@
 
             <!-- ----------------- MAIN APP CONTENT ----------------- -->
             <div id="app-content" class="hidden max-w-7xl mx-auto flex flex-col gap-6 font-sans">
-                
+
+                <!-- Data-quality warnings from backend (missing sheets / unavailable analyses) -->
+                <div id="data-warnings-banner" class="hidden bg-[#fffbeb] border border-[#f59e0b]/40 rounded-lg px-4 py-3"></div>
+
                 <!-- 1. Executive Summary Tab -->
                 <div id="tab-ringkasan" class="tab-pane flex flex-col gap-6">
                     <!-- Page Header -->
@@ -1001,6 +1004,6 @@
     </div>
 
     <!-- Inject frontend logic -->
-    <script src="app.js?v=1.0.2"></script>
+    <script src="app.js?v=1.1.0"></script>
 </body>
 </html>

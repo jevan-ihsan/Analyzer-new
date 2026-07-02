@@ -4,6 +4,13 @@ const defaultLiniBisnis = ["Mikro", "KUR", "KPP", "Konsumtif", "Retail & Korpora
 let activeFilters = new Set(defaultLiniBisnis);
 let notifications = [];
 
+// Escape user-derived strings before inserting them into HTML
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = String(str);
+    return div.innerHTML;
+}
+
 // Initialize on load
 document.addEventListener('DOMContentLoaded', () => {
     // Load theme from localStorage
@@ -45,27 +52,20 @@ async function checkStatus() {
         const data = await res.json();
         
         hasData = data.has_data;
-        
-        // Populate sample dropdown (kept for fallback)
-        const select = document.getElementById('welcome-sample-select');
-        if (select) {
-            select.innerHTML = '';
-            data.default_files.forEach(f => {
-                const opt = document.createElement('option');
-                opt.value = f;
-                opt.textContent = f;
-                select.appendChild(opt);
-            });
-        }
 
         if (hasData) {
-            // Update Active Files list
+            // Update Active Files list (filenames are user-controlled — never inject raw)
             const filesContainer = document.getElementById('active-files-container');
             filesContainer.innerHTML = '';
             data.processed_files.forEach(f => {
                 const el = document.createElement('div');
                 el.className = 'flex items-center gap-1.5 text-on-surface-variant font-medium overflow-hidden text-ellipsis whitespace-nowrap';
-                el.innerHTML = `<span class="text-primary font-bold">✅</span> <span>${f}</span>`;
+                const check = document.createElement('span');
+                check.className = 'text-primary font-bold';
+                check.textContent = '✅';
+                const name = document.createElement('span');
+                name.textContent = f;
+                el.append(check, name);
                 filesContainer.appendChild(el);
             });
 
@@ -87,32 +87,6 @@ async function checkStatus() {
         }
     } catch (err) {
         console.error('Gagal mengambil status:', err);
-    }
-}
-
-// Select sample file
-async function loadSampleFile() {
-    const filename = document.getElementById('welcome-sample-select').value;
-    if (!filename) return;
-    
-    showLoading('Memuat file contoh ' + filename + '...');
-    try {
-        const res = await fetch('/api/select-sample', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ filename })
-        });
-        
-        if (!res.ok) {
-            const err = await res.json();
-            alert('Error: ' + (err.detail || 'Gagal memuat file'));
-        } else {
-            await checkStatus();
-        }
-    } catch (err) {
-        alert('Gagal menghubungi server.');
-    } finally {
-        hideLoading();
     }
 }
 
@@ -197,18 +171,44 @@ function switchTab(tabId) {
     }
 }
 
+// Render the data-quality warnings banner (missing sheets, unavailable analyses)
+function renderDataWarnings(warnings) {
+    const banner = document.getElementById('data-warnings-banner');
+    if (!banner) return;
+    banner.innerHTML = '';
+    if (!warnings || warnings.length === 0) {
+        banner.classList.add('hidden');
+        return;
+    }
+    banner.classList.remove('hidden');
+    const title = document.createElement('div');
+    title.className = 'font-semibold text-[#92400e] flex items-center gap-1.5 mb-1';
+    title.innerHTML = '<span class="material-symbols-outlined text-[16px]">warning</span> Data Tidak Lengkap';
+    banner.appendChild(title);
+    warnings.forEach(w => {
+        const line = document.createElement('div');
+        line.className = 'text-[12px] text-[#92400e]/90 leading-relaxed';
+        line.textContent = '• ' + w;
+        banner.appendChild(line);
+    });
+}
+
 // Load and populate ratios / insights
 async function loadDashboardData() {
     try {
         const res = await fetch('/api/dashboard');
         if (!res.ok) {
-            const err = await res.json();
+            const err = await res.json().catch(() => ({}));
             console.error('Error dashboard:', err.detail);
+            renderDataWarnings(['Gagal memuat data dashboard: ' + (err.detail || res.status)]);
             return;
         }
-        
+
         const data = await res.json();
-        
+
+        // 0. Data-quality warnings from the backend
+        renderDataWarnings(data.data_warnings);
+
         // 1. Populate KPI Cards on Ringkasan
         document.getElementById('kpi-gearing-val').textContent = data.kpis.gearing.val;
         document.getElementById('kpi-gearing-status').innerHTML = `<span class="material-symbols-outlined text-[14px]">trending_flat</span><span>${data.kpis.gearing.status}</span>`;
@@ -312,11 +312,12 @@ async function loadDashboardData() {
             if (depositoEl) depositoEl.textContent = `${depositoPctFormatted}% (${data.investasi.deposito_val})`;
             if (reksadanaEl) reksadanaEl.textContent = `${reksadanaPctFormatted}% (${data.investasi.reksadana_val})`;
         } else {
-            if (donutTotalEl) donutTotalEl.textContent = data.solvency.equity ?? '--';
-            if (donutEl) donutEl.style.background = 'conic-gradient(#006565 0% 45%, #64748b 45% 75%, #e6e8ea 75% 100%)';
-            if (sbsnEl) sbsnEl.textContent = '45,0% (Rp 543,09 M)';
-            if (depositoEl) depositoEl.textContent = '30,0% (Rp 362,06 M)';
-            if (reksadanaEl) reksadanaEl.textContent = '25,0% (Rp 301,72 M)';
+            // No investment breakdown parsed — show empty state, never invented numbers
+            if (donutTotalEl) donutTotalEl.textContent = '--';
+            if (donutEl) donutEl.style.background = 'conic-gradient(#e6e8ea 0% 100%)';
+            if (sbsnEl) sbsnEl.textContent = '--';
+            if (depositoEl) depositoEl.textContent = '--';
+            if (reksadanaEl) reksadanaEl.textContent = '--';
         }
 
         document.getElementById('table-health-container').innerHTML = data.tables.health;
@@ -324,28 +325,28 @@ async function loadDashboardData() {
         document.getElementById('dupont-narrative-container').innerHTML = data.cause_effect.dupont;
 
         // 6. Populate OJK compliance indicators & table
-        const ojkCrVal = data.ratios?.ojk_padk47?.current_ratio ?? 100.0;
-        document.getElementById('ojk-cr-val').textContent = ojkCrVal.toLocaleString('id-ID', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + '%';
-        const crBadge = document.getElementById('ojk-cr-badge');
-        crBadge.textContent = ojkCrVal >= 100.0 ? 'SEHAT' : 'TIDAK SEHAT';
-        crBadge.className = ojkCrVal >= 100.0 ? 'text-[10px] font-bold px-2 py-0.5 rounded border border-[#006565]/30 bg-[#006565]/10 text-primary' : 'text-[10px] font-bold px-2 py-0.5 rounded border border-error/30 bg-error/10 text-error';
-        document.getElementById('ojk-cr-icon').setAttribute('stroke', ojkCrVal >= 100.0 ? '#006565' : '#ba1a1a');
-
-        // BOPO
-        const ojkBopoVal = data.ratios?.ojk_padk47?.bopo_syariah ?? 90.0;
-        document.getElementById('ojk-bopo-val').textContent = ojkBopoVal.toLocaleString('id-ID', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + '%';
-        const bopoBadge = document.getElementById('ojk-bopo-badge');
-        bopoBadge.textContent = ojkBopoVal <= 90.0 ? 'SEHAT' : 'TIDAK SEHAT';
-        bopoBadge.className = ojkBopoVal <= 90.0 ? 'text-[10px] font-bold px-2 py-0.5 rounded border border-[#006565]/30 bg-[#006565]/10 text-primary' : 'text-[10px] font-bold px-2 py-0.5 rounded border border-error/30 bg-error/10 text-error';
-        document.getElementById('ojk-bopo-icon').setAttribute('stroke', ojkBopoVal <= 90.0 ? '#006565' : '#ba1a1a');
-
-        // Leverage
-        const ojkLeverageVal = data.ratios?.ojk_padk47?.leverage_ratio_ojk ?? 1.5;
-        document.getElementById('ojk-leverage-val').textContent = ojkLeverageVal.toLocaleString('id-ID', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + 'x';
-        const leverageBadge = document.getElementById('ojk-leverage-badge');
-        leverageBadge.textContent = ojkLeverageVal <= 3.0 ? 'SEHAT' : 'TIDAK SEHAT';
-        leverageBadge.className = ojkLeverageVal <= 3.0 ? 'text-[10px] font-bold px-2 py-0.5 rounded border border-[#006565]/30 bg-[#006565]/10 text-primary' : 'text-[10px] font-bold px-2 py-0.5 rounded border border-error/30 bg-error/10 text-error';
-        document.getElementById('ojk-leverage-icon').setAttribute('stroke', ojkLeverageVal <= 3.0 ? '#006565' : '#ba1a1a');
+        // Missing/zero values render as N/A — never as an at-threshold "healthy" number
+        const BADGE_OK = 'text-[10px] font-bold px-2 py-0.5 rounded border border-[#006565]/30 bg-[#006565]/10 text-primary';
+        const BADGE_BAD = 'text-[10px] font-bold px-2 py-0.5 rounded border border-error/30 bg-error/10 text-error';
+        const BADGE_NA = 'text-[10px] font-bold px-2 py-0.5 rounded border border-outline-variant bg-surface-container-low text-on-surface-variant';
+        function setOjkIndicator(prefix, val, suffix, isHealthy) {
+            const valEl = document.getElementById(`ojk-${prefix}-val`);
+            const badge = document.getElementById(`ojk-${prefix}-badge`);
+            const icon = document.getElementById(`ojk-${prefix}-icon`);
+            if (!val) {
+                if (valEl) valEl.textContent = 'N/A';
+                if (badge) { badge.textContent = 'DATA TIDAK TERSEDIA'; badge.className = BADGE_NA; }
+                if (icon) icon.setAttribute('stroke', '#6e7979');
+                return;
+            }
+            const healthy = isHealthy(val);
+            if (valEl) valEl.textContent = val.toLocaleString('id-ID', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + suffix;
+            if (badge) { badge.textContent = healthy ? 'SEHAT' : 'TIDAK SEHAT'; badge.className = healthy ? BADGE_OK : BADGE_BAD; }
+            if (icon) icon.setAttribute('stroke', healthy ? '#006565' : '#ba1a1a');
+        }
+        setOjkIndicator('cr', data.ratios?.ojk_padk47?.current_ratio, '%', v => v >= 100.0);
+        setOjkIndicator('bopo', data.ratios?.ojk_padk47?.bopo_syariah, '%', v => v <= 90.0);
+        setOjkIndicator('leverage', data.ratios?.ojk_padk47?.leverage_ratio_ojk, 'x', v => v <= 3.0);
 
         document.getElementById('table-ojk-container').innerHTML = data.tables.ojk;
 
@@ -380,6 +381,7 @@ async function loadDashboardData() {
 
     } catch (err) {
         console.error('Gagal mengambil data dashboard:', err);
+        renderDataWarnings(['Gagal memuat data dashboard. Periksa koneksi ke server lalu muat ulang halaman.']);
     }
 }
 
