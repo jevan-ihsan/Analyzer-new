@@ -1,12 +1,102 @@
 import os
+import logging
 import pandas as pd
 import numpy as np
 import re
 import datetime
 
+logger = logging.getLogger("jpas.parser")
+
 def normalize_string(s):
     """Normalize string by removing extra spaces, newlines, and converting to lowercase"""
     return re.sub(r'\s+', ' ', str(s).strip().lower())
+
+# ---------------------------------------------------------------------------
+# Fuzzy account-label matching (fallback when the exact label chains miss)
+# ---------------------------------------------------------------------------
+# Words that carry no meaning for account identification
+_LABEL_STOPWORDS = {'dan', 'yang', 'di', 'pada', 'dalam', 'dari', 'ke', 'atas',
+                    'untuk', 'per', 'rugi', 'the', 'of', 'and', 'a'}
+
+def _tokenize_label(s):
+    tokens = re.split(r'[^a-z0-9]+', str(s).lower())
+    return {t for t in tokens if t and t not in _LABEL_STOPWORDS}
+
+def _fuzzy_match_account(label_norm, synonym_table):
+    """
+    Token-subset matcher: a synonym phrase matches when every significant word
+    of the phrase appears somewhere in the row label, regardless of word order
+    or extra words. Single-word phrases must match the label exactly (too
+    ambiguous otherwise). Returns the canonical key with the most specific
+    (longest) matching phrase, or None.
+    """
+    label_tokens = _tokenize_label(label_norm)
+    if not label_tokens:
+        return None
+    best_key, best_score = None, 0
+    for key, phrases, excludes in synonym_table:
+        if any(x in label_norm for x in excludes):
+            continue
+        for phrase in phrases:
+            ptokens = _tokenize_label(phrase)
+            if len(ptokens) <= 1:
+                if label_norm != phrase:
+                    continue
+                score = 1.5
+            elif ptokens <= label_tokens:
+                score = len(ptokens)
+            else:
+                continue
+            if score > best_score:
+                best_key, best_score = key, score
+    if best_key:
+        logger.info("Fuzzy-matched account label '%s' -> '%s'", label_norm, best_key)
+    return best_key
+
+# Synonym variants NOT covered by the exact chains in parse_unified_pl_sheet.
+# Format: (canonical_key, [phrase variants], [exclusion substrings])
+PL_FALLBACK_SYNONYMS = [
+    ('ijk_revenue', ['pendapatan ijk', 'premi bruto', 'pendapatan premi bruto',
+                     'pendapatan bruto penjaminan', 'imbal jasa kafalah',
+                     'gross premium', 'kontribusi bruto'], ['ybmp', 'ditangguhkan', 'piutang', 'utang']),
+    ('reinsurance_expense', ['premi reasuransi', 'beban reasuransi', 'kontribusi reasuransi',
+                             'reasuransi keluar'], ['komisi', 'klaim', 'tawidh', 'piutang', 'utang', 'aset']),
+    ('change_unearned_ijk', ['perubahan premi belum merupakan pendapatan',
+                             'perubahan ujrah ybmp', 'perubahan ijk ybmp'], []),
+    ('net_underwriting_revenue', ['pendapatan premi neto', 'premi neto', 'net premium',
+                                  'pendapatan bersih penjaminan'], []),
+    ('gross_claims', ['beban klaim bruto', 'klaim bruto', 'gross claims'], ['reasuransi', 'retensi', 'piutang', 'utang', 'cadangan']),
+    ('reinsurance_claims', ['klaim reasuransi', 'tawidh reasuransi'], ['piutang', 'utang']),
+    ('net_recoveries', ['pendapatan subrogasi', 'recoveries bersih', 'hasil subrogasi'], []),
+    ('net_underwriting_result', ['laba underwriting', 'surplus underwriting',
+                                 'surplus defisit underwriting'], []),
+    ('investment_income', ['pendapatan investasi', 'investment income',
+                           'hasil investasi bersih'], ['piutang', 'beban']),
+    ('total_operating_expense', ['beban operasional', 'biaya operasional',
+                                 'beban umum administrasi', 'opex'], ['pendapatan']),
+    ('operating_profit', ['laba operasional', 'ebit'], ['sebelum', 'setelah']),
+    ('pretax_profit', ['laba sebelum pajak penghasilan', 'ebt'], []),
+    ('net_profit', ['laba bersih', 'laba periode berjalan', 'net income',
+                    'laba setelah pajak penghasilan'], ['komprehensif', 'ditahan', 'saldo']),
+]
+
+# Synonym variants for aggregate balance-sheet accounts (section-independent).
+BS_FALLBACK_SYNONYMS = [
+    ('cash_and_bank', ['kas setara kas', 'kas bank', 'cash equivalents', 'kas giro'], ['arus', 'bersih']),
+    ('total_current_assets', ['total aset lancar', 'jumlah aktiva lancar', 'total aktiva lancar',
+                              'total current assets'], []),
+    ('total_assets', ['total aktiva', 'jumlah aktiva', 'total assets'], ['lancar', 'tetap', 'reasuransi', 'pajak', 'lain']),
+    ('total_current_liabilities', ['total liabilitas lancar', 'jumlah kewajiban lancar',
+                                   'jumlah kewajiban jangka pendek', 'total kewajiban lancar'], []),
+    ('total_liabilities', ['total kewajiban', 'jumlah kewajiban', 'total liabilities'],
+     ['ekuitas', 'modal', 'lancar', 'jangka', 'lain']),
+    ('total_equity', ['total modal sendiri', 'jumlah modal sendiri', 'total equity'], ['liabilitas', 'kewajiban', 'disetor', 'bersih']),
+    ('fixed_assets', ['aktiva tetap', 'property and equipment'], []),
+    ('claims_reserve', ['liabilitas klaim', 'cadangan teknis klaim'], ['piutang', 'utang klaim']),
+    ('piutang_ijk_lancar', ['piutang premi', 'piutang ujrah', 'piutang kontribusi'], ['ckpn', 'reasuransi']),
+    ('capital', ['modal saham', 'share capital'], []),
+    ('retained_earnings', ['laba ditahan'], []),
+]
 
 def clean_value(val):
     """Convert value to float if possible, otherwise return 0.0"""
@@ -53,6 +143,60 @@ def format_date_header(val):
         months_id = ["", "Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
         return f"{months_id[month_num]} {year}"
     return val_str
+
+def _generate_combined_headers(row_top, row_sub):
+    """Generate combined unique column headers from top and sub rows."""
+    num_cols = len(row_top)
+    curr_top = ""
+    headers = []
+    for col_i in range(num_cols):
+        val_top = str(row_top[col_i]).strip() if pd.notna(row_top[col_i]) else ""
+        if val_top != "" and val_top.lower() != 'nan':
+            curr_top = val_top
+            
+        val_sub = row_sub[col_i]
+        val_sub_str = format_date_header(val_sub) if pd.notna(val_sub) else ""
+        if val_sub_str.lower() == 'nan':
+            val_sub_str = ""
+            
+        if curr_top != "" and val_sub_str != "":
+            if val_sub_str.lower() in curr_top.lower():
+                combined = curr_top
+            elif curr_top.lower() in val_sub_str.lower():
+                combined = val_sub_str
+            else:
+                combined = f"{curr_top} - {val_sub_str}"
+        elif curr_top != "":
+            combined = curr_top
+        elif val_sub_str != "":
+            combined = val_sub_str
+        else:
+            combined = f"Col_{col_i}"
+            
+        combined = re.sub(r'\s+', ' ', combined).strip()
+        headers.append(combined)
+        
+    return make_columns_unique(headers)
+
+def _extract_header_and_data(df, row_top, row_sub, data_start_idx, desc_col_idx=0):
+    unique_headers = _generate_combined_headers(row_top, row_sub)
+    desc_col_name = unique_headers[desc_col_idx]
+    
+    df_data = df.iloc[data_start_idx:].copy()
+    df_data.columns = unique_headers
+    
+    df_data = df_data[df_data[desc_col_name].notna()]
+    df_data = df_data[df_data[desc_col_name].astype(str).str.strip() != '']
+    df_data = df_data[~df_data[desc_col_name].astype(str).str.strip().str.lower().isin(['nan', 'none', 'keterangan', 'uraian'])]
+    df_data = df_data[~df_data[desc_col_name].astype(str).str.strip().str.isdigit()]
+    
+    cols_to_keep = [c for c in df_data.columns if not any(x in c.lower() for x in ['column', 'unnamed'])]
+    df_data = df_data[cols_to_keep]
+    
+    for col in df_data.columns[1:]:
+        df_data[col] = df_data[col].apply(clean_value)
+        
+    return df_data
 
 def filter_statement_columns(df):
     cols_to_keep = []
@@ -122,67 +266,19 @@ def parse_full_statement_sheet(xl, keyword):
         if len(row_check) > 0 and all(x.isdigit() for x in row_check if x != ''):
             data_start_idx += 1
             
-    num_cols = df.shape[1]
     row_top = df.iloc[top_row_idx].tolist()
     row_sub = df.iloc[sub_row_idx].tolist()
     
-    curr_top = ""
-    headers = []
-    for col_i in range(num_cols):
-        val_top = str(row_top[col_i]).strip() if pd.notna(row_top[col_i]) else ""
-        if val_top != "" and val_top.lower() != 'nan':
-            curr_top = val_top
-            
-        val_sub = row_sub[col_i]
-        val_sub_str = format_date_header(val_sub) if pd.notna(val_sub) else ""
-        if val_sub_str.lower() == 'nan':
-            val_sub_str = ""
-            
-        if curr_top != "" and val_sub_str != "":
-            if val_sub_str.lower() in curr_top.lower():
-                combined = curr_top
-            elif curr_top.lower() in val_sub_str.lower():
-                combined = val_sub_str
-            else:
-                combined = f"{curr_top} - {val_sub_str}"
-        elif curr_top != "":
-            combined = curr_top
-        elif val_sub_str != "":
-            combined = val_sub_str
-        else:
-            combined = f"Col_{col_i}"
-            
-        combined = re.sub(r'\s+', ' ', combined).strip()
-        headers.append(combined)
-        
-    unique_headers = make_columns_unique(headers)
-    desc_col_name = unique_headers[desc_col_idx]
+    df_data = _extract_header_and_data(df, row_top, row_sub, data_start_idx, desc_col_idx)
     
-    df_data = df.iloc[data_start_idx:].copy()
-    df_data.columns = unique_headers
-    
-    df_data = df_data[df_data[desc_col_name].notna()]
-    df_data = df_data[df_data[desc_col_name].astype(str).str.strip() != '']
-    df_data = df_data[~df_data[desc_col_name].astype(str).str.strip().str.lower().isin(['nan', 'none', 'keterangan', 'uraian'])]
-    
+    # Filter empty/zero columns
+    desc_col_name = df_data.columns[0]
     active_cols = [desc_col_name]
-    active_indices = [desc_col_idx]
-    for col_i in range(num_cols):
-        if col_i == desc_col_idx:
-            continue
-        col_name = unique_headers[col_i]
-        col_vals = df_data[col_name].apply(lambda x: 0.0 if pd.isna(x) else float(x) if isinstance(x, (int, float)) else 0.0)
-        if col_vals.abs().sum() > 0:
-            active_cols.append(col_name)
-            active_indices.append(col_i)
+    for col in df_data.columns[1:]:
+        if df_data[col].abs().sum() > 0:
+            active_cols.append(col)
             
-    df_result = df_data.iloc[:, active_indices].copy()
-    df_result.columns = [unique_headers[idx] for idx in active_indices]
-    
-    for col in df_result.columns[1:]:
-        df_result[col] = df_result[col].apply(lambda x: 0.0 if pd.isna(x) else float(x) if isinstance(x, (int, float)) else 0.0)
-        
-    return df_result
+    return df_data[active_cols].copy()
 
 def parse_cash_flow_sheet(xl, sheet_name=None):
     """Parse the Cash Flow sheet from any JPAS Excel file"""
@@ -253,60 +349,7 @@ def parse_cash_flow_sheet(xl, sheet_name=None):
         row_sub = df.iloc[header_idx].tolist()
         data_start_idx = header_idx + 1
 
-    num_cols = df.shape[1]
-    raw_headers = []
-    curr_top = ""
-    for col_i in range(num_cols):
-        val_top = str(row_top[col_i]).strip() if pd.notna(row_top[col_i]) else ""
-        if val_top != "" and val_top.lower() != 'nan':
-            curr_top = val_top
-        val_sub = str(row_sub[col_i]).strip() if pd.notna(row_sub[col_i]) else ""
-        
-        # Format dates if sub-header is date/timestamp
-        formatted_sub = format_date_header(row_sub[col_i]) if pd.notna(row_sub[col_i]) else ""
-        
-        # Combine top and sub headers nicely
-        if curr_top != "" and formatted_sub != "" and formatted_sub.lower() != 'nan' and curr_top.lower() != formatted_sub.lower():
-            raw_headers.append(f"{curr_top} - {formatted_sub}")
-        elif formatted_sub != "" and formatted_sub.lower() != 'nan':
-            raw_headers.append(formatted_sub)
-        elif curr_top != "":
-            raw_headers.append(curr_top)
-        else:
-            raw_headers.append("")
-
-    unique_headers = []
-    seen = {}
-    for h in raw_headers:
-        if h in ['nan', 'None', '']:
-            h_str = 'Keterangan' if len(unique_headers) == 0 or (len(unique_headers) > 0 and 'keterangan' not in [x.lower() for x in unique_headers]) else 'Column'
-        else:
-            h_str = h
-        if h_str in seen:
-            seen[h_str] += 1
-            unique_headers.append(f"{h_str}_{seen[h_str]}")
-        else:
-            seen[h_str] = 0
-            unique_headers.append(h_str)
-            
-    df_sliced = df.iloc[data_start_idx:].copy()
-    df_sliced.columns = unique_headers
-    
-    # Remove columns that are Column or nan/unnamed
-    cols_to_keep = [c for c in df_sliced.columns if not any(x in c.lower() for x in ['column', 'unnamed'])]
-    df_sliced = df_sliced[cols_to_keep]
-    
-    # Remove rows where first column is nan or empty
-    first_col = df_sliced.columns[0]
-    df_sliced = df_sliced[df_sliced[first_col].notna()]
-    df_sliced = df_sliced[df_sliced[first_col].astype(str).str.strip() != '']
-    df_sliced = df_sliced[~df_sliced[first_col].astype(str).str.strip().str.isdigit()]
-    
-    # Clean numeric values
-    for col in df_sliced.columns[1:]:
-        df_sliced[col] = df_sliced[col].apply(clean_value)
-        
-    return df_sliced
+    return _extract_header_and_data(df, row_top, row_sub, data_start_idx, desc_col_idx)
 
 def parse_huw_sheet(xl, sheet_name=None):
     """Parse the Input HUW sheet containing underwriting drivers"""
@@ -739,11 +782,11 @@ def parse_evaluasi_anper(file_path):
             'gearing_ratio': gearing if gearing > 0 else (os_net / equity if equity > 0 else 0)
         }
     else:
-        eq_val = bs_data.get('total_equity', {}).get('curr_month', 1206870.0)
+        eq_val = bs_data.get('total_equity', {}).get('curr_month', 0.0)
         gr_data = {
-            'os_net': 35783954.0,
+            'os_net': 0.0,
             'equity': eq_val,
-            'gearing_ratio': 35783954.0 / eq_val if eq_val > 0 else 29.65
+            'gearing_ratio': 0.0
         }
     pl_df = parse_full_statement_sheet(xl, 'Input PL')
     if pl_df is not None:
@@ -980,7 +1023,30 @@ def classify_columns(df_headers):
                 continue
             if '2026-04-01' in h_norm or h_norm == 'apr-26':
                 col_mapping['prev_month'] = idx
-                
+
+    # Generic fallback: if no explicitly recognized current-period column was found,
+    # anchor curr/prev/yoy to the latest month-year column detected above so files
+    # from other reporting cycles work without hardcoded period labels.
+    # 'Desember' is excluded as an anchor because December columns in these
+    # workbooks are audited prior-year balances, not the reporting month.
+    if 'curr_month' not in col_mapping:
+        month_candidates = []
+        for key in col_mapping:
+            m = re.match(r'^(Januari|Februari|Maret|April|Mei|Juni|Juli|Agustus|September|Oktober|November) (20\d{2})$', str(key))
+            if m:
+                month_candidates.append((int(m.group(2)), months_id.index(m.group(1)), key))
+        if month_candidates:
+            month_candidates.sort()
+            year, m_num, key = month_candidates[-1]
+            col_mapping['curr_month'] = col_mapping[key]
+            prev_key = f"{months_id[m_num - 1]} {year}" if m_num > 1 else f"Desember {year - 1}"
+            yoy_key = f"{months_id[m_num]} {year - 1}"
+            if prev_key in col_mapping:
+                col_mapping.setdefault('prev_month', col_mapping[prev_key])
+            if yoy_key in col_mapping:
+                col_mapping.setdefault('yoy_prev', col_mapping[yoy_key])
+                col_mapping.setdefault('prev_year_yoy', col_mapping[yoy_key])
+
     return col_mapping
 
 def parse_unified_bs_sheet(df):
@@ -1054,34 +1120,7 @@ def parse_unified_bs_sheet(df):
             row_sub = df.iloc[header_row_idx].tolist()
             data_start_idx = header_row_idx + 1
         
-    headers = []
-    curr_top = ""
-    for col_i in range(num_cols):
-        val_top = str(row_top[col_i]).strip() if pd.notna(row_top[col_i]) else ""
-        if val_top != "" and val_top.lower() != 'nan':
-            curr_top = val_top
-        val_sub = row_sub[col_i]
-        val_sub_str = format_date_header(val_sub) if pd.notna(val_sub) else ""
-        if val_sub_str.lower() == 'nan':
-            val_sub_str = ""
-            
-        if curr_top != "" and val_sub_str != "":
-            if val_sub_str.lower() in curr_top.lower():
-                combined = curr_top
-            elif curr_top.lower() in val_sub_str.lower():
-                combined = val_sub_str
-            else:
-                combined = f"{curr_top} - {val_sub_str}"
-        elif curr_top != "":
-            combined = curr_top
-        elif val_sub_str != "":
-            combined = val_sub_str
-        else:
-            combined = f"Col_{col_i}"
-        combined = re.sub(r'\s+', ' ', combined).strip()
-        headers.append(combined)
-        
-    unique_headers = make_columns_unique(headers)
+    unique_headers = _generate_combined_headers(row_top, row_sub)
     col_mapping = classify_columns(unique_headers)
     
     if not col_mapping:
@@ -1323,6 +1362,10 @@ def parse_unified_bs_sheet(df):
         elif ('jumlah ekuitas' in label_norm or label_norm == 'ekuitas' or label_norm == 'total ekuitas') and 'liabilitas' not in label_norm:
             mapped_key = 'total_equity'
 
+        # Fallback: fuzzy synonym matching for labels the exact chain missed
+        if mapped_key is None:
+            mapped_key = _fuzzy_match_account(label_norm, BS_FALLBACK_SYNONYMS)
+
         if mapped_key:
             if mapped_key not in bs_data:
                 bs_data[mapped_key] = {}
@@ -1453,34 +1496,7 @@ def parse_unified_pl_sheet(df):
             row_sub = df.iloc[header_row_idx].tolist()
             data_start_idx = header_row_idx + 1
         
-    headers = []
-    curr_top = ""
-    for col_i in range(num_cols):
-        val_top = str(row_top[col_i]).strip() if pd.notna(row_top[col_i]) else ""
-        if val_top != "" and val_top.lower() != 'nan':
-            curr_top = val_top
-        val_sub = row_sub[col_i]
-        val_sub_str = format_date_header(val_sub) if pd.notna(val_sub) else ""
-        if val_sub_str.lower() == 'nan':
-            val_sub_str = ""
-            
-        if curr_top != "" and val_sub_str != "":
-            if val_sub_str.lower() in curr_top.lower():
-                combined = curr_top
-            elif curr_top.lower() in val_sub_str.lower():
-                combined = val_sub_str
-            else:
-                combined = f"{curr_top} - {val_sub_str}"
-        elif curr_top != "":
-            combined = curr_top
-        elif val_sub_str != "":
-            combined = val_sub_str
-        else:
-            combined = f"Col_{col_i}"
-        combined = re.sub(r'\s+', ' ', combined).strip()
-        headers.append(combined)
-        
-    unique_headers = make_columns_unique(headers)
+    unique_headers = _generate_combined_headers(row_top, row_sub)
     col_mapping = classify_columns(unique_headers)
     
     if not col_mapping:
@@ -1536,14 +1552,24 @@ def parse_unified_pl_sheet(df):
             mapped_key = 'pretax_profit'
         elif 'laba setelah pajak' in label_norm or 'laba tahun berjalan' in label_norm:
             mapped_key = 'net_profit'
-            
+
+        # Fallback: fuzzy synonym matching for labels the exact chain missed
+        if mapped_key is None:
+            mapped_key = _fuzzy_match_account(label_norm, PL_FALLBACK_SYNONYMS)
+
         if mapped_key:
             if mapped_key not in pl_data:
                 pl_data[mapped_key] = {}
+            # Commission lines come in main + 'tangguhan' (deferred) sub-rows that must be
+            # summed, not overwritten (e.g. Komisi penjaminan ulang + ...tangguhan).
+            accumulate = mapped_key in ('reinsurance_commission', 'commission_expense')
             for category, col_idx in col_mapping.items():
                 val = clean_value(df.iloc[r_idx, col_idx])
-                pl_data[mapped_key][category] = val
-                
+                if accumulate and category in pl_data[mapped_key]:
+                    pl_data[mapped_key][category] += val
+                else:
+                    pl_data[mapped_key][category] = val
+
     # Normalize scale if represented in millions
     if 'ijk_revenue' in pl_data:
         vals = [v for v in pl_data['ijk_revenue'].values() if pd.notna(v) and v != 0.0]
@@ -1646,8 +1672,8 @@ def parse_excel_file(file_path):
                     mitra_parsed = parse_rekapan_kafalah(file_path, sheet_name=sheet)
                     score = len(mitra_parsed.get('mitra_data', []))
                     sheet_candidates['Mitra'].append((sheet, (score, 0), mitra_parsed))
-        except Exception as e:
-            print(f"Error parsing sheet '{sheet}': {e}")
+        except Exception:
+            logger.exception("Error parsing sheet '%s' in file '%s'", sheet, os.path.basename(file_path))
             continue
             
     # Select the most complete candidate sheet for each type
@@ -1686,11 +1712,11 @@ def parse_excel_file(file_path):
             
     if not result['gr_data'] and result['bs_data']:
         eq_val = result['bs_data'].get('total_equity', {}).get('curr_month', 0.0)
-        eq_val_m = eq_val / 1_000_000.0 if eq_val > 0 else 1206870.0
+        eq_val_m = eq_val / 1_000_000.0 if eq_val > 0 else 0.0
         result['gr_data'] = {
-            'os_net': 35783954.0,
+            'os_net': 0.0,
             'equity': eq_val_m,
-            'gearing_ratio': 35783954.0 / eq_val_m if eq_val_m > 0 else 29.65
+            'gearing_ratio': 0.0
         }
         
     # Ensure backward compatibility for app.py UI
