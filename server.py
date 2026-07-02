@@ -1,8 +1,12 @@
 import os
 import re
+import secrets
 import tempfile
+import time
+import logging
 import uvicorn
 import io
+import uuid
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,35 +16,92 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import pandas as pd
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Import local modules
 from parser import parse_excel_file, merge_financial_dicts
 from analyzer import calculate_ratios
 from reasoning import generate_takeaways_and_critique
+from utils import format_id, detect_current_period, MONTHS_ID
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s"
+)
+logger = logging.getLogger("jpas")
 
 _ACCESS_TOKEN = os.environ.get("JPAS_ACCESS_TOKEN", "").strip()
+
+# Upload constraints
+ALLOWED_UPLOAD_EXTENSIONS = {".xlsx", ".xlsm", ".xls"}
+MAX_UPLOAD_MB = float(os.environ.get("MAX_UPLOAD_MB", "20"))
+MAX_UPLOAD_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
+MAX_FILES_PER_UPLOAD = int(os.environ.get("MAX_FILES_PER_UPLOAD", "10"))
 
 def verify_token(request: Request):
     if not _ACCESS_TOKEN:
         return  # token auth disabled — open beta mode
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer ") or auth[7:] != _ACCESS_TOKEN:
+    if not auth.startswith("Bearer ") or not secrets.compare_digest(auth[7:], _ACCESS_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-# Global State
-state = {
-    'consolidated_data': {
-        'pl_data': {},
-        'bs_data': {},
-        'gr_data': {},
-        'mitra_data': [],
-        'cfs_data': None,
-        'huw_data': None,
-        'pl_df': None,
-        'bs_df': None
-    },
-    'processed_files': set()
-}
+def _validate_upload(filename: str, content: bytes):
+    """Reject files with disallowed extensions or excessive size before parsing."""
+    ext = os.path.splitext(filename or "")[1].lower()
+    if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Tipe file tidak didukung ({ext or 'tanpa ekstensi'}). Gunakan file Excel (.xlsx/.xlsm/.xls)."
+        )
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Ukuran file melebihi batas {MAX_UPLOAD_MB:.0f} MB."
+        )
+
+# Session-Isolated State Cache
+session_states = {}
+MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "200"))
+SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_HOURS", "24")) * 3600
+_UUID_RE = re.compile(r"^[0-9a-fA-F-]{32,36}$")
+
+def get_default_state():
+    return {
+        'consolidated_data': {
+            'pl_data': {},
+            'bs_data': {},
+            'gr_data': {},
+            'mitra_data': [],
+            'cfs_data': None,
+            'huw_data': None,
+            'pl_df': None,
+            'bs_df': None
+        },
+        'processed_files': set(),
+        'last_access': time.time()
+    }
+
+def _evict_stale_sessions():
+    """Drop expired sessions; if still over capacity, drop the least-recently used."""
+    now = time.time()
+    expired = [sid for sid, st in session_states.items() if now - st.get('last_access', 0) > SESSION_TTL_SECONDS]
+    for sid in expired:
+        del session_states[sid]
+    while len(session_states) > MAX_SESSIONS:
+        oldest = min(session_states, key=lambda s: session_states[s].get('last_access', 0))
+        del session_states[oldest]
+
+def get_session_state(request: Request) -> dict:
+    session_id = getattr(request.state, "session_id", "default")
+    if session_id not in session_states:
+        _evict_stale_sessions()
+        session_states[session_id] = get_default_state()
+    state = session_states[session_id]
+    state['last_access'] = time.time()
+    return state
 
 def _file_priority_score(filename):
     """
@@ -64,8 +125,8 @@ def _file_priority_score(filename):
         return int(date_match.group(1)) // 1000  # relative numeric ordering
     return 20  # default (analysis/enhanced xlsx)
 
-def _merge_parsed_into_state(parsed_data, filename):
-    """Merge parsed data into global state."""
+def _merge_parsed_into_state(state, parsed_data, filename):
+    """Merge parsed data into session state."""
     state['consolidated_data']['pl_data'] = merge_financial_dicts(
         state['consolidated_data']['pl_data'], parsed_data['pl_data'])
     state['consolidated_data']['bs_data'] = merge_financial_dicts(
@@ -96,7 +157,9 @@ def _merge_parsed_into_state(parsed_data, filename):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[STARTUP] JPAS Financial Analyzer ready. Upload Excel files via the dashboard.")
+    logger.info("JPAS Financial Analyzer ready. Upload Excel files via the dashboard.")
+    if not _ACCESS_TOKEN:
+        logger.warning("JPAS_ACCESS_TOKEN is not set — API auth is disabled. Restrict network access or set a token before wider rollout.")
     yield
 
 limiter = Limiter(key_func=get_remote_address)
@@ -110,7 +173,51 @@ app.add_middleware(
     allow_origins=os.environ.get("ALLOWED_ORIGINS", "http://localhost:8501").split(","),
     allow_credentials=True,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "Authorization"],
+)
+
+_COOKIE_SECURE = os.environ.get("SESSION_COOKIE_SECURE", "").lower() in ("1", "true", "yes")
+
+@app.middleware("http")
+async def session_middleware(request: Request, call_next):
+    # Retrieve session ID from cookies or headers; only accept well-formed IDs
+    # so clients can't register arbitrary strings as state-dict keys.
+    incoming = request.cookies.get("session_id") or request.headers.get("x-session-id") or ""
+    if _UUID_RE.match(incoming):
+        session_id = incoming
+        is_new = False
+    else:
+        session_id = str(uuid.uuid4())
+        is_new = True
+
+    request.state.session_id = session_id
+    response = await call_next(request)
+
+    if is_new:
+        response.set_cookie(
+            key="session_id",
+            value=session_id,
+            path="/",
+            httponly=True,
+            samesite="lax",
+            secure=_COOKIE_SECURE,
+            max_age=7 * 24 * 3600
+        )
+    return response
+
+# 'unsafe-inline' is required by the Tailwind CDN runtime config and inline
+# onclick handlers in index.html; the CSP still restricts all external origins
+# to the two CDNs and Google Fonts.
+_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com; "
+    "img-src 'self' data:; "
+    "connect-src 'self'; "
+    "frame-ancestors 'none'; "
+    "object-src 'none'; "
+    "base-uri 'self'"
 )
 
 @app.middleware("http")
@@ -118,8 +225,9 @@ async def security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = _CSP
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     return response
 
 def clean_html(html_str):
@@ -127,65 +235,7 @@ def clean_html(html_str):
     html_str = re.sub(r'\s+', ' ', html_str)
     return html_str.strip()
 
-def format_id(val, is_pct=False, is_currency=False, is_ratio=False, decimals=2, prefix="", suffix=""):
-    """
-    Format a numeric value in Indonesian style:
-    - Dot as thousands separator
-    - Comma as decimal separator
-    - Handle strings, NaNs, floats, ints
-    """
-    if pd.isna(val) or val is None:
-        return "-"
-    
-    try:
-        if isinstance(val, str):
-            val_clean = val.replace('Rp', '').replace('%', '').replace('x', '').replace(' ', '').strip()
-            if not val_clean:
-                return "-"
-            if ',' in val_clean and '.' in val_clean:
-                if val_clean.rfind('.') > val_clean.rfind(','):
-                    val_clean = val_clean.replace(',', '')
-                else:
-                    val_clean = val_clean.replace('.', '').replace(',', '.')
-            elif ',' in val_clean:
-                parts = val_clean.split(',')
-                if len(parts[-1]) == 3:
-                    val_clean = val_clean.replace(',', '')
-                else:
-                    val_clean = val_clean.replace(',', '.')
-            elif '.' in val_clean:
-                parts = val_clean.split('.')
-                if len(parts[-1]) == 3:
-                    val_clean = val_clean.replace('.', '')
-                else:
-                    pass
-            val_num = float(val_clean)
-        else:
-            val_num = float(val)
-    except Exception:
-        return str(val)
-        
-    if abs(val_num) < 1e-9:
-        return "-"
-        
-    fmt_str = f"{{:,.{decimals}f}}"
-    formatted = fmt_str.format(val_num)
-    
-    parts = formatted.split('.')
-    thousands = parts[0].replace(',', '.')
-    if len(parts) > 1:
-        decimal = parts[1]
-        result = f"{thousands},{decimal}"
-    else:
-        result = thousands
-        
-    if is_pct:
-        return f"{prefix}{result}%{suffix}"
-    elif is_currency:
-        return f"Rp{prefix}{result}{suffix}"
-    elif is_ratio:
-        return f"{prefix}{result}x{suffix}"
-    return f"{prefix}{result}{suffix}"
+
 
 def evaluate_ratio(val, key):
     if val is None or pd.isna(val) or abs(val) < 1e-9:
@@ -217,7 +267,8 @@ def evaluate_ratio(val, key):
     return "✅ MEMENUHI" if passed else "❌ TIDAK MEMENUHI"
 
 def to_beautiful_table(df, align_right_cols=None):
-    html = """
+    import html
+    html_output = """
     <div class="overflow-x-auto border border-outline-variant rounded-lg shadow-sm" style="margin-bottom: 24px; font-family: 'Inter', sans-serif;">
         <table class="w-full text-left border-collapse bg-surface-container-lowest text-[13.5px]">
             <thead>
@@ -225,8 +276,9 @@ def to_beautiful_table(df, align_right_cols=None):
     """
     for col in df.columns:
         align = "right" if align_right_cols is not None and col in align_right_cols else "left"
-        html += f'<th class="px-5 py-3 font-semibold text-on-surface text-xs uppercase tracking-wider text-{align}">{col}</th>'
-    html += "</tr></thead><tbody>"
+        escaped_col = html.escape(str(col))
+        html_output += f'<th class="px-5 py-3 font-semibold text-on-surface text-xs uppercase tracking-wider text-{align}">{escaped_col}</th>'
+    html_output += "</tr></thead><tbody>"
     
     for _, row in df.iterrows():
         label = str(row.iloc[0]).upper()
@@ -237,27 +289,28 @@ def to_beautiful_table(df, align_right_cols=None):
         row_bg = "bg-surface-container-low" if is_total else "bg-surface-container-lowest"
         border_bottom = "border-b-2 border-outline-variant" if is_total else "border-b border-outline-variant/30"
         
-        html += f'<tr class="{row_bg} {border_bottom} hover:bg-surface-container-high transition-colors">'
+        html_output += f'<tr class="{row_bg} {border_bottom} hover:bg-surface-container-high transition-colors">'
         for i, val in enumerate(row):
             str_val = str(val)
+            escaped_str_val = html.escape(str_val)
             align = "right" if align_right_cols is not None and df.columns[i] in align_right_cols else "left"
             font_family = "font-body-md"
             
-            disp_val = str_val
+            disp_val = escaped_str_val
             cell_color = text_color
             if align == "right" and ("%" in str_val or "x" in str_val or "Rp" in str_val or val == "0.00" or str_val.replace(',', '').replace('.', '').replace('-', '').isnumeric()):
                 if str_val.startswith("-"):
                     cell_color = "text-error font-medium"
-                    disp_val = f"↓ {str_val}"
+                    disp_val = f"↓ {escaped_str_val}"
                 elif "YoY" in df.columns[i] and str_val != "0.00" and not str_val.startswith("-"):
                     cell_color = "text-primary font-medium"
-                    disp_val = f"↑ {str_val}"
+                    disp_val = f"↑ {escaped_str_val}"
 
-            html += f'<td class="px-5 py-3 {weight} {cell_color} text-{align} {font_family}">{disp_val}</td>'
-        html += "</tr>"
+            html_output += f'<td class="px-5 py-3 {weight} {cell_color} text-{align} {font_family}">{disp_val}</td>'
+        html_output += "</tr>"
         
-    html += "</tbody></table></div>"
-    return clean_html(html)
+    html_output += "</tbody></table></div>"
+    return clean_html(html_output)
 
 def format_md_to_html(md_text):
     html = md_text
@@ -270,7 +323,8 @@ def health_check():
     return {"status": "ok"}
 
 @app.get("/api/status")
-def get_status():
+def get_status(request: Request):
+    state = get_session_state(request)
     has_data = bool(state['consolidated_data'].get('pl_data') or state['consolidated_data'].get('bs_data'))
     return {
         "has_data": has_data,
@@ -280,62 +334,75 @@ def get_status():
 @app.post("/api/upload")
 @limiter.limit("10/minute")
 async def upload_file(request: Request, file: UploadFile = File(...), _=Depends(verify_token)):
-    suffix = os.path.splitext(file.filename)[1]
+    state = get_session_state(request)
+    content = await file.read()
+    _validate_upload(file.filename, content)
+    suffix = os.path.splitext(file.filename)[1].lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
-        
+
     try:
         parsed_data = parse_excel_file(tmp_path)
-        os.remove(tmp_path)
     except Exception as e:
+        logger.exception("Failed to parse uploaded file '%s'", file.filename)
+        raise HTTPException(status_code=400, detail=f"Gagal memproses file: {str(e)}")
+    finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-        raise HTTPException(status_code=400, detail=f"Gagal memproses file: {str(e)}")
         
     if not (parsed_data.get('pl_data') or parsed_data.get('bs_data')):
         raise HTTPException(status_code=400, detail="Tidak dapat menemukan data Laba Rugi atau Neraca yang valid pada file.")
         
-    _merge_parsed_into_state(parsed_data, file.filename)
+    _merge_parsed_into_state(state, parsed_data, file.filename)
     return {"status": "success", "processed_files": list(state['processed_files'])}
 
 @app.post("/api/upload-multiple")
 @limiter.limit("10/minute")
 async def upload_multiple_files(request: Request, files: list[UploadFile] = File(...), _=Depends(verify_token)):
+    state = get_session_state(request)
     """
     Upload and merge multiple Excel files.
     Files are sorted by priority (oldest/draft first, newest/realisasi/lapkeu last)
     so that the most authoritative data wins in the merge.
     """
+    if len(files) > MAX_FILES_PER_UPLOAD:
+        raise HTTPException(status_code=400, detail=f"Maksimal {MAX_FILES_PER_UPLOAD} file per unggahan.")
+
     errors = []
     processed = []
-    # First pass: read all files to temp paths
+    # First pass: validate and write all files to temp paths
     file_queue = []
     for file in files:
-        suffix = os.path.splitext(file.filename)[1]
+        content = await file.read()
+        try:
+            _validate_upload(file.filename, content)
+        except HTTPException as e:
+            errors.append(f"{file.filename}: {e.detail}")
+            continue
+        suffix = os.path.splitext(file.filename)[1].lower()
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
         file_queue.append((file.filename, tmp_path))
     # Sort: process draft/older files first, official/newer files last
     file_queue.sort(key=lambda x: _file_priority_score(x[0]))
-    
+
     # Second pass: parse and merge in sorted order
     for filename, tmp_path in file_queue:
         try:
             parsed_data = parse_excel_file(tmp_path)
-            os.remove(tmp_path)
             if not (parsed_data.get('pl_data') or parsed_data.get('bs_data')):
                 errors.append(f"{filename}: Tidak dapat menemukan data Laba Rugi atau Neraca yang valid.")
                 continue
-            _merge_parsed_into_state(parsed_data, filename)
+            _merge_parsed_into_state(state, parsed_data, filename)
             processed.append(filename)
         except Exception as e:
+            logger.exception("Failed to parse uploaded file '%s'", filename)
+            errors.append(f"{filename}: {str(e)}")
+        finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
-            errors.append(f"{filename}: {str(e)}")
             
     return {
         "status": "success",
@@ -345,10 +412,12 @@ async def upload_multiple_files(request: Request, files: list[UploadFile] = File
     }
 
 @app.get("/api/export")
-def export_excel(_=Depends(verify_token)):
+def export_excel(request: Request, _=Depends(verify_token)):
     output = io.BytesIO()
+    state = get_session_state(request)
     parsed = state['consolidated_data']
-    
+    period = detect_current_period(parsed.get('pl_data'), parsed.get('bs_data'))
+
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         pl_keys = parsed.get('pl_data', {})
         if pl_keys:
@@ -381,7 +450,7 @@ def export_excel(_=Depends(verify_token)):
                         pl_keys[k].get('prev_year_yoy', 0.0),
                         achievement
                     ])
-            df_pl = pd.DataFrame(pl_rows, columns=['Uraian Keuangan', 'YTD Mei 2026', 'YTD Mei 2025 (YoY)', 'Pencapaian RKAP FY (%)'])
+            df_pl = pd.DataFrame(pl_rows, columns=['Uraian Keuangan', f"YTD {period['label']}", f"YTD {period['yoy_label']} (YoY)", 'Pencapaian RKAP FY (%)'])
             df_pl.to_excel(writer, sheet_name='Laba Rugi', index=False)
             
         bs_keys = parsed.get('bs_data', {})
@@ -410,7 +479,7 @@ def export_excel(_=Depends(verify_token)):
                         bs_keys[k].get('curr_month', 0.0),
                         bs_keys[k].get('prev_year_yoy', 0.0)
                     ])
-            df_bs = pd.DataFrame(bs_rows, columns=['Pos Neraca', 'Mei 2026', 'YoY Mei 2025'])
+            df_bs = pd.DataFrame(bs_rows, columns=['Pos Neraca', period['label'], f"YoY {period['yoy_label']}"])
             df_bs.to_excel(writer, sheet_name='Neraca', index=False)
             
         cfs_df = parsed.get('cfs_data')
@@ -426,22 +495,14 @@ def export_excel(_=Depends(verify_token)):
 
 
 @app.post("/api/reset")
-def reset_session(_=Depends(verify_token)):
-    state['consolidated_data'] = {
-        'pl_data': {},
-        'bs_data': {},
-        'gr_data': {},
-        'mitra_data': [],
-        'cfs_data': None,
-        'huw_data': None,
-        'pl_df': None,
-        'bs_df': None
-    }
-    state['processed_files'] = set()
+def reset_session(request: Request, _=Depends(verify_token)):
+    session_id = getattr(request.state, "session_id", "default")
+    session_states[session_id] = get_default_state()
     return {"status": "success"}
 
 @app.get("/api/dashboard")
-def get_dashboard_data(_=Depends(verify_token)):
+def get_dashboard_data(request: Request, _=Depends(verify_token)):
+    state = get_session_state(request)
     parsed = state['consolidated_data']
     has_data = bool(parsed.get('pl_data') or parsed.get('bs_data'))
     if not has_data:
@@ -450,20 +511,19 @@ def get_dashboard_data(_=Depends(verify_token)):
     # Calculate ratios and generate reasoning
     ratios = calculate_ratios(parsed)
     analysis = generate_takeaways_and_critique(ratios, parsed)
-    
+    period = ratios['period']
+    data_warnings = list(ratios.get('data_warnings', []))
+
     # ------------------ PRE-PROCESS KPI CARDS ------------------
     gr_val = ratios['solvency']['gearing_ratio']
     lr_val = ratios['underwriting']['loss_ratio']
-    roa_val = ratios.get('ojk_health', {}).get('roa_pct', 3.2)
-    
+    roa_val = ratios.get('ojk_health', {}).get('roa_pct', 0.0)
+
     net_profit_ytd = parsed['pl_data'].get('net_profit', {}).get('curr_month', 0.0) / 1_000_000_000.0
     yoy_growth = ratios['profitability']['yoy_profit_growth_pct']
-    
+
     ijk_bruto_ytd = parsed['pl_data'].get('ijk_revenue', {}).get('curr_month', 0.0) / 1_000_000_000.0
-    ijk_yoy_growth = ratios['profitability'].get('yoy_ijk_growth_pct', 5.0)
-    
-    if net_profit_ytd == 0: net_profit_ytd = 45.0
-    if ijk_bruto_ytd == 0: ijk_bruto_ytd = 120.0
+    ijk_yoy_growth = ratios['underwriting'].get('yoy_ijk_bruto_pct', 0.0)
     
     kpis = {
         "gearing": {"val": f"{format_id(gr_val, decimals=1)}x", "status": f"Limit POJK: {format_id(40.0, decimals=1)}x", "type": "neutral"},
@@ -474,30 +534,28 @@ def get_dashboard_data(_=Depends(verify_token)):
     }
     
     # ------------------ PRE-PROCESS CHARTS ------------------
-    # Monthly trend chart extrapolation
-    if 'ijk_revenue' in parsed['pl_data']:
-        curr_val = parsed['pl_data']['ijk_revenue'].get('curr_month', 0.0) / 1_000_000_000.0
-        # Check if Mei 2026 and April 2026 monthly MTD values are directly available
-        monthly_may = parsed['pl_data']['ijk_revenue'].get('Mei 2026', 0.0) / 1_000_000_000.0
-        monthly_april = parsed['pl_data']['ijk_revenue'].get('April 2026', 0.0) / 1_000_000_000.0
-        
-        if monthly_may == 0.0:
-            prev_val = parsed['pl_data']['ijk_revenue'].get('prev_month', 0.0) / 1_000_000_000.0
-            monthly_may = max(curr_val - prev_val, 0.0)
-            
-        if monthly_april == 0.0:
-            monthly_april = 78.485328760
-            
-        # Dynamically reconstruct April YTD: May YTD - May MTD
-        april_ytd = curr_val - monthly_may if curr_val > 0 else 328.12262
-        
-        # jan_mar_total is April YTD - April MTD
-        jan_mar_total = max(april_ytd - monthly_april, 0.0)
-        monthly_avg_jan_mar = jan_mar_total / 3.0
-        trend_values = [monthly_avg_jan_mar, monthly_avg_jan_mar, monthly_avg_jan_mar, monthly_april, monthly_may]
-    else:
-        trend_values = [83.2, 83.2, 83.2, 78.5, 77.0]
-        
+    # Monthly trend chart extrapolation over the detected reporting period
+    curr_month_num = period['month']
+    trend_labels = [MONTHS_ID[i][:3] for i in range(curr_month_num)]
+    trend_values = [0.0] * curr_month_num
+
+    if 'ijk_revenue' in parsed['pl_data'] and curr_month_num >= 2:
+        ijk = parsed['pl_data']['ijk_revenue']
+        curr_val = ijk.get('curr_month', 0.0) / 1_000_000_000.0
+        # MTD values for the current and previous month, if directly available
+        monthly_curr = ijk.get(period['label'], 0.0) / 1_000_000_000.0
+        monthly_prev = ijk.get(period['prev_label'], 0.0) / 1_000_000_000.0
+
+        if monthly_curr == 0.0:
+            prev_ytd = ijk.get('prev_month', 0.0) / 1_000_000_000.0
+            monthly_curr = max(curr_val - prev_ytd, 0.0)
+
+        # Reconstruct earlier months as the average of the remaining YTD amount
+        earlier_total = max(curr_val - monthly_curr - monthly_prev, 0.0)
+        n_earlier = curr_month_num - 2
+        earlier_avg = earlier_total / n_earlier if n_earlier > 0 else 0.0
+        trend_values = [earlier_avg] * n_earlier + [monthly_prev, monthly_curr]
+
     # Portfolio breakdown
     bs_keys = parsed.get('bs_data', {})
     sbsn_val = bs_keys.get('sbsn_invest', {}).get('curr_month', 0.0)
@@ -509,10 +567,14 @@ def get_dashboard_data(_=Depends(verify_token)):
         deposito_pct = (deposito_val / total_invest) * 100
         reksadana_pct = (reksadana_val / total_invest) * 100
     else:
-        sbsn_pct, deposito_pct, reksadana_pct = 45.0, 30.0, 25.0
-        
+        sbsn_pct = deposito_pct = reksadana_pct = 0.0
+        data_warnings.append(
+            "Rincian portofolio investasi (SBSN/Deposito/Reksadana) tidak ditemukan di Neraca — "
+            "grafik alokasi investasi tidak tersedia."
+        )
+
     charts = {
-        "trend_labels": ["Jan", "Feb", "Mar", "Apr", "May"],
+        "trend_labels": trend_labels,
         "trend_data": [round(v, 2) for v in trend_values],
         "portfolio": [round(sbsn_pct, 1), round(deposito_pct, 1), round(reksadana_pct, 1)]
     }
@@ -552,7 +614,7 @@ def get_dashboard_data(_=Depends(verify_token)):
                     format_id(pl_keys[k].get('prev_year_yoy', 0.0)),
                     format_id(achievement, is_pct=True)
                 ])
-        df_pl_show = pd.DataFrame(pl_rows, columns=['Uraian Keuangan', 'YTD Mei 2026', 'YTD Mei 2025 (YoY)', 'Pencapaian RKAP FY (%)'])
+        df_pl_show = pd.DataFrame(pl_rows, columns=['Uraian Keuangan', f"YTD {period['label']}", f"YTD {period['yoy_label']} (YoY)", 'Pencapaian RKAP FY (%)'])
         tables_html['pl'] = to_beautiful_table(df_pl_show, align_right_cols=df_pl_show.columns[1:])
     else:
         tables_html['pl'] = "<p>Data P&L tidak tersedia.</p>"
@@ -583,7 +645,7 @@ def get_dashboard_data(_=Depends(verify_token)):
                     format_id(bs_keys[k].get('curr_month', 0.0)),
                     format_id(bs_keys[k].get('prev_year_yoy', 0.0))
                 ])
-        df_bs_show = pd.DataFrame(bs_rows, columns=['Pos Neraca', 'Mei 2026', 'YoY Mei 2025'])
+        df_bs_show = pd.DataFrame(bs_rows, columns=['Pos Neraca', period['label'], f"YoY {period['yoy_label']}"])
         tables_html['bs'] = to_beautiful_table(df_bs_show, align_right_cols=df_bs_show.columns[1:])
     else:
         tables_html['bs'] = "<p>Data Neraca tidak tersedia.</p>"
@@ -601,32 +663,7 @@ def get_dashboard_data(_=Depends(verify_token)):
         tables_html['cfs'] = '<p class="text-on-surface-variant italic">Data Arus Kas tidak tersedia untuk file ini.</p>'
         
     # 4. Underwriting COB Table
-    cob_data = [
-        ["Mikro", 165.80, 40.9, 238.50, 76.6, 5.90, 7.60, 7.5],
-        ["KUR", 165.10, 40.7, 99.50, 60.2, 16.70, 61.90, 60.8],
-        ["KPP", 46.00, 11.4, 0.00, 0.0, 0.00, 3.10, 3.0],
-        ["Konsumtif", 19.30, 4.8, 12.00, 62.2, 0.90, 20.60, 20.2],
-        ["Retail & Korporasi", 5.70, 1.4, 0.20, 3.2, 0.20, 6.80, 6.7],
-        ["KBG & Lainnya", 3.20, 0.8, 0.00, 0.0, 0.00, 1.50, 1.5],
-        ["TOTAL COB", 405.10, 100.0, 238.50, 58.9, 23.90, 101.80, 100.0]
-    ]
-    df_cob = pd.DataFrame(cob_data, columns=[
-        "Lini Bisnis (COB)", 
-        "IJK Bruto (Rp M)", 
-        "Pangsa Revenue", 
-        "Ta'widh Bruto (Rp M)", 
-        "Loss Ratio Bruto", 
-        "Recoveries (Rp M)", 
-        "Laba Underwriting Neto (Rp M)", 
-        "Pangsa Laba Underwriting"
-    ])
-    for col in df_cob.columns[1:]:
-        if "Pangsa" in col or "Ratio" in col:
-            df_cob[col] = df_cob[col].apply(lambda x: format_id(x, is_pct=True))
-        else:
-            df_cob[col] = df_cob[col].apply(lambda x: format_id(x))
-            
-    tables_html['cob'] = to_beautiful_table(df_cob, align_right_cols=df_cob.columns[1:])
+    tables_html['cob'] = '<p class="text-on-surface-variant italic">Data Underwriting COB tidak tersedia untuk file ini.</p>'
     
     # 5. Underwriting HUW Detail Table
     huw_df = parsed.get('huw_data')
@@ -642,28 +679,33 @@ def get_dashboard_data(_=Depends(verify_token)):
         tables_html['huw'] = '<p class="text-on-surface-variant italic">Data Driver HUW tidak tersedia untuk file ini.</p>'
         
     # 6. OJK Health Score Table
-    skor_akhir = ratios.get('ojk_health', {}).get('composite_score', 1.55)
+    ojk_health = ratios.get('ojk_health', {})
+    skor_akhir = ojk_health.get('composite_score', 0.0)
     health_data = [
-        ["1. Rasio Likuiditas", "Aset Lancar / Utang Lancar", "Estimasi Likuid", "Nilai 1 (Sangat Sehat)", "10%"],
-        ["2. Gearing Ratio", "Outstanding Neto / Modal Sendiri Bersih", f"{format_id(gr_val, decimals=2)}x", f"Nilai {ratios.get('ojk_health', {}).get('score_gearing', 2)}", "35%"],
-        ["3. Rentabilitas (ROA)", "EBT disetahunkan / Rata-rata Aset", f"{format_id(ratios.get('ojk_health', {}).get('roa_pct', 6.57), decimals=2)}%", f"Nilai {ratios.get('ojk_health', {}).get('score_roa', 1)}", "10,5% (dari 35%)"],
-        ["4. Rentabilitas (BOPO)", "Beban Op / Pendapatan Op", f"{format_id(ratios.get('ojk_health', {}).get('bopo_pct', 49.3), decimals=1)}%", f"Nilai {ratios.get('ojk_health', {}).get('score_bopo', 1)}", "12,25% (dari 35%)"],
-        ["5. Rentabilitas (Klaim Neto)", "Ta'widh Neto / IJK Neto", f"{format_id(ratios['underwriting']['loss_ratio'], decimals=1)}%", f"Nilai {ratios.get('ojk_health', {}).get('score_klaim', 1)}", "12,25% (dari 35%)"],
-        ["6. Tata Kelola (GCG)", "Self-Assessment", "Baik", "Nilai 2 (Baik)", "20%"],
+        ["1. Rasio Likuiditas", "Aset Lancar / Utang Lancar", "Asumsi*", "Nilai 1 (Asumsi)", "10%"],
+        ["2. Gearing Ratio", "Outstanding Neto / Modal Sendiri Bersih", f"{format_id(gr_val, decimals=2)}x", f"Nilai {ojk_health.get('score_gearing', '-')}", "35%"],
+        ["3. Rentabilitas (ROA)", "EBT disetahunkan / Rata-rata Aset", f"{format_id(ojk_health.get('roa_pct', 0.0), decimals=2)}%", f"Nilai {ojk_health.get('score_roa', '-')}", "10,5% (dari 35%)"],
+        ["4. Rentabilitas (BOPO)", "Beban Op / Pendapatan Op", f"{format_id(ojk_health.get('bopo_pct', 0.0), decimals=1)}%", f"Nilai {ojk_health.get('score_bopo', '-')}", "12,25% (dari 35%)"],
+        ["5. Rentabilitas (Klaim Neto)", "Ta'widh Neto / IJK Neto", f"{format_id(ratios['underwriting']['loss_ratio'], decimals=1)}%", f"Nilai {ojk_health.get('score_klaim', '-')}", "12,25% (dari 35%)"],
+        ["6. Tata Kelola (GCG)", "Self-Assessment", "Asumsi*", "Nilai 2 (Asumsi)", "20%"],
         ["SKOR KOMPOSIT AKHIR", "Weighted Average Nilai Komponen", f"{format_id(skor_akhir, decimals=2)}", "SANGAT SEHAT (Skala 1,0 - 1,8)" if skor_akhir <= 1.8 else "SEHAT (Skala 1,8 - 2,5)", "100%"]
     ]
     df_health = pd.DataFrame(health_data, columns=["Komponen Kesehatan OJK", "Indikator / Formula", "Hasil JPAS", "Nilai OJK", "Bobot"])
-    tables_html['health'] = to_beautiful_table(df_health)
+    tables_html['health'] = to_beautiful_table(df_health) + (
+        '<p class="text-[11px] text-on-surface-variant italic" style="margin-top:-16px">'
+        '* Komponen Likuiditas (Nilai 1) dan GCG (Nilai 2) adalah asumsi tetap, bukan hasil perhitungan dari file yang diunggah. '
+        'Skor komposit akhir memuat kedua asumsi tersebut.</p>'
+    )
     
     # 7. DuPont Table
     dupont = ratios.get('dupont', {})
     dupont_data = [
-        ["1. Tax Burden (Beban Pajak)", "Net Income ÷ EBT", f"{format_id(dupont.get('tax_burden', 0.826), decimals=3)}", f"{format_id(dupont.get('tax_burden', 0.826)*100, decimals=1)}% dari laba EBT tersisa setelah pajak"],
-        ["2. Interest Burden (Beban Non-Op)", "EBT ÷ EBIT", f"{format_id(dupont.get('interest_burden', 0.899), decimals=3)}", f"{format_id(dupont.get('interest_burden', 0.899)*100, decimals=1)}% dari EBIT tersisa setelah beban non-operasional"],
-        ["3. Margin EBIT (Profitabilitas)", "EBIT ÷ IJK Bruto", f"{format_id(dupont.get('ebit_margin', 0.249), decimals=3)}", f"{format_id(dupont.get('ebit_margin', 0.249)*100, decimals=1)}% dari pendapatan dikonversi menjadi laba usaha"],
-        ["4. Asset Turnover (Turnover Aset)", "IJK Bruto ÷ Avg Assets", f"{format_id(dupont.get('asset_turnover', 0.119), is_ratio=True, decimals=3)}", f"Setiap Rp1 Aset menghasilkan Rp{format_id(dupont.get('asset_turnover', 0.119), decimals=3)} pendapatan bruto"],
-        ["5. Financial Leverage (Tuas Keuangan)", "Avg Assets ÷ Avg Equity", f"{format_id(dupont.get('leverage', 2.830), is_ratio=True, decimals=3)}", f"Aset dibiayai oleh ekuitas sebesar {format_id(dupont.get('leverage', 2.830), decimals=2)}x lipat"],
-        ["RETURN ON EQUITY (ROE) DUPONT", "Tax × Non-Op × EBIT × Asset Turnover × Leverage", f"{format_id(dupont.get('roe_pct', 6.2), is_pct=True, decimals=1)}", "Estimasi margin ROE hasil dekomposisi 5-faktor"]
+        ["1. Tax Burden (Beban Pajak)", "Net Income ÷ EBT", f"{format_id(dupont.get('tax_burden', 0.0), decimals=3)}", f"{format_id(dupont.get('tax_burden', 0.0)*100, decimals=1)}% dari laba EBT tersisa setelah pajak"],
+        ["2. Interest Burden (Beban Non-Op)", "EBT ÷ EBIT", f"{format_id(dupont.get('interest_burden', 0.0), decimals=3)}", f"{format_id(dupont.get('interest_burden', 0.0)*100, decimals=1)}% dari EBIT tersisa setelah beban non-operasional"],
+        ["3. Margin EBIT (Profitabilitas)", "EBIT ÷ IJK Bruto", f"{format_id(dupont.get('ebit_margin', 0.0), decimals=3)}", f"{format_id(dupont.get('ebit_margin', 0.0)*100, decimals=1)}% dari pendapatan dikonversi menjadi laba usaha"],
+        ["4. Asset Turnover (Turnover Aset)", "IJK Bruto ÷ Avg Assets", f"{format_id(dupont.get('asset_turnover', 0.0), is_ratio=True, decimals=3)}", f"Setiap Rp1 Aset menghasilkan Rp{format_id(dupont.get('asset_turnover', 0.0), decimals=3)} pendapatan bruto"],
+        ["5. Financial Leverage (Tuas Keuangan)", "Avg Assets ÷ Avg Equity", f"{format_id(dupont.get('leverage', 0.0), is_ratio=True, decimals=3)}", f"Aset dibiayai oleh ekuitas sebesar {format_id(dupont.get('leverage', 0.0), decimals=2)}x lipat"],
+        ["RETURN ON EQUITY (ROE) DUPONT", "Tax × Non-Op × EBIT × Asset Turnover × Leverage", f"{format_id(dupont.get('roe_pct', 0.0), is_pct=True, decimals=1)}", "Estimasi margin ROE hasil dekomposisi 5-faktor"]
     ]
     df_dupont = pd.DataFrame(dupont_data, columns=["Faktor DuPont", "Formula", "Nilai Aktual", "Interpretasi Kinerja"])
     tables_html['dupont'] = to_beautiful_table(df_dupont)
@@ -746,11 +788,18 @@ def get_dashboard_data(_=Depends(verify_token)):
         "cause_effect": cause_effect,
         "solvency": solvency,
         "ratios": ratios,
-        "investasi": investasi
+        "investasi": investasi,
+        "period": period,
+        "data_warnings": data_warnings
     }
 
 # Mount static frontend directory
 app.mount("/", StaticFiles(directory="frontend", html=True), name="static")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8501)
+    # Bind to localhost by default; set HOST=0.0.0.0 explicitly to expose on the network.
+    uvicorn.run(
+        app,
+        host=os.environ.get("HOST", "127.0.0.1"),
+        port=int(os.environ.get("PORT", "8501"))
+    )
