@@ -34,5 +34,8 @@ __pycache__/
 
 # Internal / dev-only files
 stitch_output/
+output/
 GEMINI.md
-test_*.py
+# Only ignore ad-hoc test scripts in the project root — tests/ stays tracked
+/test_*.py
+.pytest_cache/

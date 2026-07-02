@@ -27,11 +27,12 @@ cp .env.example .env
 ```bash
 python server.py
 ```
-Server berjalan di **http://localhost:8501** secara default.
+Server berjalan di **http://127.0.0.1:8501** secara default (hanya bisa diakses dari mesin lokal).
+Untuk mengekspos ke jaringan, set `HOST=0.0.0.0` secara eksplisit — sebaiknya hanya di belakang reverse proxy dengan TLS.
 
 Atau dengan uvicorn langsung:
 ```bash
-uvicorn server:app --host 0.0.0.0 --port 8501 --reload
+uvicorn server:app --host 127.0.0.1 --port 8501 --reload
 ```
 
 ---
@@ -53,6 +54,14 @@ uvicorn server:app --host 0.0.0.0 --port 8501 --reload
 |---|---|---|
 | `ALLOWED_ORIGINS` | `http://localhost:8501` | CORS origins yang diizinkan, pisahkan dengan koma |
 | `JPAS_ACCESS_TOKEN` | _(kosong)_ | Token opsional untuk auth layer di reverse proxy |
+| `HOST` | `127.0.0.1` | Alamat bind server. Set `0.0.0.0` hanya jika perlu diakses dari jaringan |
+| `PORT` | `8501` | Port server |
+| `MAX_UPLOAD_MB` | `20` | Batas ukuran file upload per file (MB) |
+| `MAX_FILES_PER_UPLOAD` | `10` | Batas jumlah file per upload multiple |
+| `MAX_SESSIONS` | `200` | Batas jumlah sesi in-memory sebelum sesi terlama dihapus |
+| `SESSION_TTL_HOURS` | `24` | Sesi tidak aktif melebihi durasi ini dihapus otomatis |
+| `SESSION_COOKIE_SECURE` | _(false)_ | Set `true` jika sudah di belakang HTTPS agar cookie sesi ber-flag `Secure` |
+| `LOG_LEVEL` | `INFO` | Level logging (`DEBUG`/`INFO`/`WARNING`/`ERROR`) |
 
 ---
 
